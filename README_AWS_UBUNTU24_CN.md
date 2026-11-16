@@ -169,14 +169,14 @@ fab create --nodes 4
 fab info
 ```
 
-可以提前安装，也可以直接运行。`fab install` 在控制机和实验机准备系统依赖、Rust 1.60.0、tmux、chrony，并在实验机克隆/更新配置的仓库。已有依赖会复用，脚本等待 SSH 就绪和时间同步；要求 `ubuntu` 用户能够无交互执行 sudo。
+先运行 `fab install`。它在控制机和实验机准备系统依赖、Rust 1.60.0、tmux、chrony，在实验机克隆/更新配置的仓库，然后编译全部运行中的 Bullshark 实验机和控制机。安装和编译的 stdout/stderr 实时显示，多台机器的输出可能交错。已有依赖和 Cargo 构建产物会复用；要求 `ubuntu` 用户能够无交互执行 sudo。
 
 ```bash
 cd /home/ubuntu/experiments/narwhal-bullshark-ubuntu24/benchmark
 fab install
 ```
 
-运行默认 20 节点实验：
+等待 `fab install` 成功结束，显示 `ready for fab remote`，再运行默认 20 节点实验：
 
 ```bash
 cd /home/ubuntu/experiments/narwhal-bullshark-ubuntu24/benchmark
@@ -185,13 +185,24 @@ export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 fab remote
 ```
 
-`fab remote` 自动执行安装准备，所以 `fab install` 是可选的。随后在所有选中实验机和控制机执行 `cargo build --locked --release --features benchmark`，生成并上传配置、启动客户端/节点、下载日志、汇总结果。**所有实验机编译控制机当前 HEAD**，该提交必须已经推送且属于 `settings.json` 的 `repo.branch`；远端分支在安装过程中前进也不会混用不同提交。脚本拒绝未提交的 Rust、proto、Cargo 配置和锁文件改动，但允许本地调整 `fabfile.py` 和 `settings.json`。请先提交并推送 Rust 源码改动，然后更新控制机再运行。可以在终端输出和 `results/remote-commit.txt` 查看此次提交。
+两条命令分工明确：**`fab install` 负责安装、同步代码和编译；`fab remote` 负责检查已编译版本、生成/上传配置、启动测试、下载日志和汇总结果。** `fab remote` 不运行 apt、rustup、Git fetch 或 Cargo build。
+
+`fab install` 在所有实验机和控制机执行 `cargo build --locked --release --features benchmark`，固定到控制机当前 HEAD；该提交必须已经推送且属于 `settings.json` 的 `repo.branch`。编译成功后在各自的 `target/release/.bullshark-build-commit` 写入提交号。`fab remote` 检查版本记录和可执行文件，缺失或不匹配就报错并提示先运行 `fab install`。重复运行相同版本的测试无需重新安装/编译；更新控制机提交、新增机器或删除构建产物后需要再次 `fab install`。首次从旧版迁移也要执行一次 `fab install` 来生成版本记录，已有 `target/` 缓存可以复用。
+
+脚本拒绝未提交的 Rust、proto、Cargo 配置和锁文件改动，但允许本地调整 `fabfile.py` 和 `settings.json`。请先提交并推送 Rust 源码改动，再更新控制机、执行 `fab install`。可以在 `results/remote-commit.txt` 查看每次测试使用的提交。
 
 降低输入速率进行首次连通性测试，或调整节点数量时，无需编辑 fabfile：
 
 ```bash
 cd /home/ubuntu/experiments/narwhal-bullshark-ubuntu24/benchmark
 fab remote --nodes 20 --rate 5000 --duration 30 --faults 0 --runs 1
+```
+
+如果目前每个区域只有两台、总共 10 台机器，`fab install` 会编译这 10 台，运行时明确传入节点数：
+
+```bash
+cd /home/ubuntu/experiments/narwhal-bullshark-ubuntu24/benchmark
+fab remote --nodes 10
 ```
 
 默认 `--workers 1`、`--tx-size 512`；`--faults` 表示不启动委员会尾部的部分节点，只模拟离线故障。非零故障时客户端输入也受到在线 worker 数量影响，不能把相同 `--rate` 参数直接理解为相同实际注入吞吐。
@@ -216,7 +227,7 @@ tar -czf "/home/ubuntu/experiments/bullshark-archives/run-$(date +%Y%m%d-%H%M%S)
     logs results settings.json fabfile.py
 ```
 
-首次编译通常明显长于 80 秒；目前远程编译输出由 Fabric 隐藏直到命令结束或出错。Rust 下载需要访问 GitHub、crates.io 和 static.rust-lang.org。缺少主机、安装失败、编译失败或日志解析失败都会使 `fab remote` 返回非零退出码。`chronyc waitsync` 超时则检查节点时间同步后重试，跨机器的端到端延迟依赖时钟对齐。
+首次 `fab install` 的编译通常明显长于 80 秒，终端现在实时显示安装和编译输出。Cargo 会复用已有构建产物，但 RocksDB 首次构建和 release 链接仍可能耗时。Rust 下载需要访问 GitHub、crates.io 和 static.rust-lang.org。安装/编译失败使 `fab install` 返回非零退出码；缺少主机、缺少匹配的构建产物、启动或日志解析失败使 `fab remote` 返回非零退出码。`chronyc waitsync` 超时则检查节点时间同步后重试，跨机器的端到端延迟依赖时钟对齐。
 
 ## 6. 停止、恢复和销毁
 
@@ -259,7 +270,7 @@ fab info
 
 ## 验证范围与参考
 
-自动化验证覆盖 AMI 查询和选择、AWS 分页发现及实例隔离、地址到 SSH 主机的转换、默认参数、错误退出、自动安装顺序、不均衡区域分配，以及真实本地 Git 仓库的重复更新和固定提交检出。检查使用 Python 3.12，并保留原有本地和日志解析回归测试。测试不连接 AWS。
+自动化验证覆盖 AMI 查询和选择、AWS 分页发现及实例隔离、地址到 SSH 主机的转换、默认参数、错误退出、安装编译与运行分离、可见输出、失败编译清除版本记录、缺失/过期构建检查、不均衡区域分配，以及真实本地 Git 仓库的重复更新和固定提交检出。检查使用 Python 3.12，并保留原有本地和日志解析回归测试。测试不连接 AWS。
 
 当前修改环境是 Windows，没有可用 Ubuntu/WSL 发行版或此控制机的 SSH 会话；**尚未完成 Ubuntu 24.04 Rust release 编译及真实 EC2 集群的端到端实测**。上述检查不能替代首次云端低负载运行。
 
@@ -268,6 +279,7 @@ fab info
 ```bash
 cd /home/ubuntu/experiments/narwhal-bullshark-ubuntu24/benchmark
 python3 -m unittest discover -s tests -v
+fab install
 fab remote --nodes 20 --rate 5000 --duration 30
 ```
 

@@ -12,6 +12,7 @@ from copy import deepcopy
 from itertools import zip_longest
 from pathlib import Path
 from shlex import quote
+from os import access, X_OK
 import subprocess
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
@@ -37,6 +38,7 @@ class ExecutionError(Exception):
 
 class Bench:
     TMUX_SOCKET = 'bullshark-benchmark'
+    BUILD_MARKER = '.bullshark-build-commit'
 
     def __init__(self, ctx):
         self.manager = InstanceManager.make()
@@ -131,7 +133,7 @@ chronyc waitsync 60 0.01 0.0 1
             cwd=root, text=True,
         ).strip()
         if changed:
-            raise BenchError('Commit and push build-source changes before fab remote',
+            raise BenchError('Commit and push build-source changes, then run fab install',
                              RuntimeError(changed))
         return subprocess.check_output(['git', 'rev-parse', 'HEAD'],
                                        cwd=root, text=True).strip()
@@ -159,16 +161,19 @@ chronyc waitsync 60 0.01 0.0 1
                              RuntimeError('Run fab info; create or start the testbed first'))
         Print.info('Preparing Ubuntu 24.04, Rust 1.60.0, GCC 12, Clang 14 and chrony...')
         try:
+            self.revision = self._controller_revision()
             subprocess.run(['bash', '-lc', self._dependency_command()], check=True)
             self._wait_for_ssh(hosts)
-            command = self._dependency_command() + '\n' + self._repository_command()
+            command = self._dependency_command()
             with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
                        connect_timeout=15) as group:
-                group.run(f'bash -lc {quote(command)}', hide=True)
-            Print.heading(f'Initialized testbed of {len(hosts)} nodes')
-        except (GroupException, subprocess.SubprocessError, OSError, SSHException) as e:
+                group.run(f'bash -lc {quote(command)}', hide=False)
+            self._update(hosts, collocate=True)
+            self._build_local()
+            Print.heading(f'Built commit {self.revision} on the controller and {len(hosts)} nodes; ready for fab remote')
+        except (GroupException, Failure, subprocess.SubprocessError, OSError, SSHException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
-            raise BenchError('Failed to install repo on testbed', e)
+            raise BenchError('Failed to install/build testbed; fix the error and rerun fab install', e)
 
     def kill(self, hosts=None, delete_logs=False):
         hosts = self.manager.hosts(flat=True) if hosts is None else hosts
@@ -235,39 +240,90 @@ chronyc waitsync 60 0.01 0.0 1
             ips = list(set([x for y in hosts for x in y]))
 
         revision = self.revision
-        Print.info(f'Building controller commit {revision} on {len(ips)} machines...')
+        Print.info(f'Building controller commit {revision} on {len(ips)} machines (live output)...')
         repo = quote(self.settings.repo_name)
         cmd = [
             self._repository_command(revision),
-            'export PATH="$HOME/.cargo/bin:$PATH"',
-            'unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC',
-            f'(cd {repo}/node && {CommandMaker.compile()})',
+            f'(cd {repo}/node && bash -lc {quote(self._build_command())})',
             f'ln -sfn {repo}/target/release/node node',
             f'ln -sfn {repo}/target/release/benchmark_client benchmark_client',
         ]
         with Group(*ips, user='ubuntu', connect_kwargs=self.connect) as group:
-            group.run(f'bash -lc {quote(" && ".join(cmd))}', hide=True)
-        Path(PathMaker.results_path()).mkdir(exist_ok=True)
-        Path(PathMaker.results_path(), 'remote-commit.txt').write_text(revision + '\n')
+            group.run(f'bash -lc {quote(" && ".join(cmd))}', hide=False)
+
+    def _build_command(self):
+        # Run from the node crate on either the controller or an experiment
+        # host. Remove an old success stamp before attempting a rebuild.
+        marker = quote(f'../target/release/{self.BUILD_MARKER}')
+        return '\n'.join([
+            'set -euo pipefail',
+            'export PATH="$HOME/.cargo/bin:$PATH"',
+            'unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC',
+            f'rm -f -- {marker}',
+            CommandMaker.compile(),
+            'test -x ../target/release/node',
+            'test -x ../target/release/benchmark_client',
+            f'printf "%s\\n" {quote(self.revision)} > {marker}',
+        ])
+
+    def _build_local(self):
+        Print.info(f'Building controller commit {self.revision} locally (live output)...')
+        if self._controller_revision() != self.revision:
+            raise BenchError('Controller commit changed during fab install',
+                             RuntimeError('Rerun fab install from a stable checkout'))
+        subprocess.run(['bash', '-lc', self._build_command()], check=True,
+                       cwd=PathMaker.node_crate_path())
+        try:
+            if self._controller_revision() != self.revision:
+                raise BenchError('Controller commit changed during compilation',
+                                 RuntimeError('Rerun fab install from a stable checkout'))
+        except (BenchError, subprocess.SubprocessError, OSError):
+            Path(PathMaker.binary_path(), self.BUILD_MARKER).unlink(missing_ok=True)
+            raise
+
+    def _binary_check_command(self):
+        release = quote(f'{self.settings.repo_name}/target/release')
+        return ' && '.join([
+            f'test "$(cat {release}/{self.BUILD_MARKER} 2>/dev/null)" = {quote(self.revision)}',
+            'test -x ./node',
+            'test -x ./benchmark_client',
+            f'test ./node -ef {release}/node',
+            f'test ./benchmark_client -ef {release}/benchmark_client',
+        ])
+
+    def _check_binaries(self, hosts):
+        release = Path(PathMaker.binary_path())
+        try:
+            actual = (release / self.BUILD_MARKER).read_text().strip()
+            if actual != self.revision:
+                raise ValueError(f'Controller binaries: {actual}; expected {self.revision}')
+            for name in ('node', 'benchmark_client'):
+                binary = release / name
+                if not binary.is_file() or not access(binary, X_OK):
+                    raise FileNotFoundError(f'Missing executable: {binary}')
+        except (OSError, ValueError) as e:
+            raise BenchError('Controller build is missing or outdated; run fab install first', e)
+        Print.info(f'Checking installed binaries for commit {self.revision} on {len(hosts)} machines...')
+        try:
+            with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                       connect_timeout=15) as group:
+                group.run(f'bash -lc {quote(self._binary_check_command())}', hide=True)
+        except GroupException as e:
+            raise BenchError('Remote build is missing, outdated or unreachable; run fab install first',
+                             FabricError(e))
 
     def _config(self, hosts, node_parameters, bench_parameters):
         Print.info('Generating configuration files...')
 
         if self._controller_revision() != self.revision:
-            raise BenchError('Controller commit changed during remote build',
-                             RuntimeError('Rerun fab remote from a stable checkout'))
+            raise BenchError('Controller commit changed during fab remote',
+                             RuntimeError('Run fab install for the new commit before retrying'))
 
         # Cleanup all local configuration files.
         cmd = CommandMaker.cleanup()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
-        # Recompile the latest code.
-        cmd = ('export PATH="$HOME/.cargo/bin:$PATH"; '
-               'unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC; '
-               + CommandMaker.compile())
-        subprocess.run(['bash', '-lc', cmd], check=True, cwd=PathMaker.node_crate_path())
-
-        # Create alias for the client and nodes binary.
+        # Use the binaries compiled by fab install; this path never builds.
         cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
         subprocess.run([cmd], shell=True, check=True)
 
@@ -425,15 +481,9 @@ chronyc waitsync 60 0.01 0.0 1
             self.revision = self._controller_revision()
         except (subprocess.SubprocessError, OSError) as e:
             raise BenchError('Failed to identify controller build sources', e)
-        # fab remote is also the first-run entry point; fab install is optional.
-        self.install(hosts=list(dict.fromkeys(ips)))
-
-        # Update nodes.
-        try:
-            self._update(selected_hosts, bench_parameters.collocate)
-        except (GroupException, ExecutionError, subprocess.SubprocessError, OSError) as e:
-            e = FabricError(e) if isinstance(e, GroupException) else e
-            raise BenchError('Failed to update nodes', e)
+        self._check_binaries(list(dict.fromkeys(ips)))
+        Path(PathMaker.results_path()).mkdir(exist_ok=True)
+        Path(PathMaker.results_path(), 'remote-commit.txt').write_text(self.revision + '\n')
 
         # Upload all configuration files.
         try:

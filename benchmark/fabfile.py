@@ -167,7 +167,7 @@ def info(ctx):
 
 @task
 def install(ctx):
-    ''' Prepare Ubuntu 24.04 controller/workers and clone the configured repo '''
+    ''' Install dependencies and compile controller/workers with live output '''
     from benchmark.remote import Bench
     try:
         Bench(ctx).install()
@@ -179,7 +179,7 @@ def install(ctx):
 @task
 def remote(ctx, debug=False, nodes=20, workers=1, rate=50_000, tx_size=512,
            duration=80, faults=0, runs=1):
-    ''' Install, build and run a collocated Bullshark benchmark on AWS '''
+    ''' Run a collocated AWS benchmark using binaries built by fab install '''
     from benchmark.remote import Bench
     if nodes < 2 or workers < 1 or duration < 1 or rate < 0 or tx_size < 9 or runs < 1:
         raise Exit('Require nodes >= 2, workers >= 1, duration >= 1, rate >= 0, tx-size >= 9, runs >= 1.', code=2)

@@ -100,6 +100,7 @@ class RemoteTests(unittest.TestCase):
              patch.object(Bench, '_select_hosts', return_value=hosts), \
              patch.object(Bench, '_controller_revision', return_value='a' * 40), \
              patch.object(Bench, 'install'), patch.object(Bench, '_update'), \
+             patch.object(Bench, '_check_binaries', create=True), \
              patch.object(Bench, '_config', return_value=committee), \
              patch.object(Bench, '_background_run', side_effect=background), \
              patch.object(Bench, 'kill', side_effect=lambda **kw: events.append('kill')):
@@ -150,17 +151,48 @@ class RemoteTests(unittest.TestCase):
                 fabfile.remote.body(Context())
         self.assertEqual(caught.exception.code, 1)
 
-    def test_remote_installs_before_building_and_configuring(self):
+    def test_remote_checks_existing_builds_without_installing_or_compiling(self):
         import fabfile
         events = []
         with patch.object(Bench, '__init__', return_value=None), \
              patch.object(Bench, '_select_hosts', return_value=['203.0.113.1'] * 20), \
-             patch.object(Bench, 'install', side_effect=lambda **kw: events.append('install')), \
-             patch.object(Bench, '_update', side_effect=lambda *a: events.append('build')), \
+             patch.object(Bench, '_controller_revision', return_value='a' * 40), \
+             patch.object(Bench, 'install', side_effect=AssertionError('remote must not install')), \
+             patch.object(Bench, '_update', side_effect=AssertionError('remote must not build')), \
+             patch.object(Bench, '_check_binaries', create=True,
+                          side_effect=lambda *a: events.append('check')), \
              patch.object(Bench, '_config', side_effect=RuntimeError('stop before launching')):
             with self.assertRaises(RuntimeError):
                 fabfile.remote.body(Context())
-        self.assertEqual(events, ['install', 'build'])
+        self.assertEqual(events, ['check'])
+
+    def test_install_builds_controller_and_workers_with_visible_output(self):
+        bench = object.__new__(Bench)
+        bench.connect = {}
+        bench.settings = SimpleNamespace(repo_name='bullshark', repo_url='origin', branch='main')
+        events = []
+        with patch.object(Bench, '_controller_revision', return_value='a' * 40), \
+             patch.object(Bench, '_wait_for_ssh'), \
+             patch('benchmark.remote.subprocess.run', side_effect=lambda *a, **kw: events.append('dependencies')), \
+             patch('benchmark.remote.Group') as group, \
+             patch.object(Bench, '_update', side_effect=lambda *a, **kw: events.append('workers')), \
+             patch.object(Bench, '_build_local', create=True, side_effect=lambda: events.append('controller')):
+            bench.install(hosts=['203.0.113.1'])
+        self.assertEqual(events, ['dependencies', 'workers', 'controller'])
+        self.assertFalse(group.return_value.__enter__.return_value.run.call_args.kwargs['hide'])
+
+    def test_missing_build_prevents_any_configuration_or_launch(self):
+        import fabfile
+        failure = BenchError('Run fab install first', RuntimeError('missing build'))
+        with patch.object(Bench, '__init__', return_value=None), \
+             patch.object(Bench, '_select_hosts', return_value=['203.0.113.1'] * 20), \
+             patch.object(Bench, '_controller_revision', return_value='a' * 40), \
+             patch.object(Bench, 'install', side_effect=AssertionError('unexpected install')), \
+             patch.object(Bench, '_update', side_effect=AssertionError('unexpected build')), \
+             patch.object(Bench, '_check_binaries', create=True, side_effect=failure), \
+             patch.object(Bench, '_config', side_effect=RuntimeError('stop before launching')):
+            with self.assertRaises(Exit):
+                fabfile.remote.body(Context())
 
     def test_insufficient_hosts_is_an_error(self):
         import fabfile
