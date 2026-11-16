@@ -3,6 +3,7 @@ benchmark_client
 results
 plots
 demo_client
+*.before-digest-fix.bak
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

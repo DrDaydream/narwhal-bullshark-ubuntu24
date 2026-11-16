@@ -1,0 +1,6 @@
+# Shell scripts copied from Windows must remain Linux-compatible.
+*.sh text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+.cargo/config text eol=lf

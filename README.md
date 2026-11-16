@@ -1,5 +1,7 @@
 # Narwhal and Tusk
 
+> Ubuntu 24.04 EC2 / 无虚拟环境运行 `fab local`：请先阅读 [中文运行说明](README_UBUNTU24_CN.md)，按直接命令安装依赖和运行。已修复批次摘要格式不匹配导致 TPS/BPS 为 0 的统计问题。下方为上游原始说明。
+
 [![build status](https://img.shields.io/github/workflow/status/mystenlabs/narwhal/Rust/main?style=flat-square&logo=github)](https://github.com/mystenlabs/narwhal/actions)
 [![rustc](https://img.shields.io/badge/rustc-1.60+-blue?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![license](https://img.shields.io/badge/license-Apache-blue.svg?style=flat-square)](LICENSE)

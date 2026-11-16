@@ -1,7 +1,10 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 import subprocess
+from hashlib import sha256
 from math import ceil
 from os.path import basename, splitext
+from pathlib import Path
+from shlex import quote
 from time import sleep
 
 from benchmark.commands import CommandMaker
@@ -12,6 +15,8 @@ from benchmark.utils import Print, BenchError, PathMaker
 
 class LocalBench:
     BASE_PORT = 3000
+    # Separate socket per checkout; never stop the user's ordinary tmux server.
+    TMUX_SOCKET = 'narwhal-' + sha256(str(Path(__file__).resolve().parents[1]).encode()).hexdigest()[:12]
 
     def __init__(self, bench_parameters_dict, node_parameters_dict):
         try:
@@ -25,14 +30,14 @@ class LocalBench:
 
     def _background_run(self, command, log_file):
         name = splitext(basename(log_file))[0]
-        cmd = f'{command} 2> {log_file}'
-        subprocess.run(['tmux', 'new', '-d', '-s', name, cmd], check=True)
+        cmd = f'{command} > {quote(log_file)} 2>&1'
+        subprocess.run(['tmux', '-L', self.TMUX_SOCKET, 'new', '-d', '-s', name, cmd], check=True)
 
     def _kill_nodes(self):
         try:
-            cmd = CommandMaker.kill().split()
+            cmd = ['tmux', '-L', self.TMUX_SOCKET, 'kill-server']
             subprocess.run(cmd, stderr=subprocess.DEVNULL)
-        except subprocess.SubprocessError as e:
+        except (subprocess.SubprocessError, OSError) as e:
             raise BenchError('Failed to kill testbed', e)
 
     def run(self, debug=False):
@@ -57,7 +62,7 @@ class LocalBench:
 
             # Create alias for the client and nodes binary.
             cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
-            subprocess.run([cmd], shell=True)
+            subprocess.run([cmd], shell=True, check=True)
 
             # Generate configuration files.
             keys = []
@@ -122,6 +127,9 @@ class LocalBench:
             Print.info('Parsing logs...')
             return LogParser.process(PathMaker.logs_path(), faults=self.faults)
 
-        except (subprocess.SubprocessError, ParseError) as e:
+        except KeyboardInterrupt:
+            self._kill_nodes()
+            raise
+        except (subprocess.SubprocessError, OSError, ParseError, AssertionError) as e:
             self._kill_nodes()
             raise BenchError('Failed to run benchmark', e)
