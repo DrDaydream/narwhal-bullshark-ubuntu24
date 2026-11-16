@@ -17,7 +17,7 @@ sudo apt-get install -y --no-install-recommends \
     tmux git curl ca-certificates python3 python3-pip python3-dev
 ```
 
-下载本仓库（私有仓库需要先登录有访问权限的 GitHub 账号）：
+下载本仓库（公开仓库，HTTPS 克隆无需 GitHub 登录或 Token）：
 
 ```bash
 cd "$HOME"
