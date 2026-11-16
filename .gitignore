@@ -1,4 +1,7 @@
 *.json
+!benchmark/settings.example.json
+__pycache__/
+*.py[cod]
 *.python-version
 !Docker/**/*.json
 Docker/validators/**/db-*

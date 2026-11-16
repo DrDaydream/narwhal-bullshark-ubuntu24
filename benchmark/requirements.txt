@@ -1,4 +1,4 @@
-boto3==1.23.1
-fabric==2.7.0
-matplotlib==3.5.2
-multiaddr==0.0.9
+# Ubuntu 24.04 / Python 3.12, including AWS and plotting tasks.
+-r requirements-local.txt
+boto3==1.44.3
+matplotlib==3.9.4

@@ -1,6 +1,6 @@
 # Ubuntu 24.04：Bullshark 分支的 fab local
 
-完整源码及本地运行适配，包含批次摘要统计修复。**不使用虚拟环境、Conda、pipx 或 Docker**。直接使用 Ubuntu 的 `/usr/bin/python3`，Python 包安装到当前用户的 `~/.local/`。运行无需 `env-ubuntu24.sh`。
+完整源码及本地运行适配，包含批次摘要统计修复。**不使用虚拟环境、Conda、pipx 或 Docker**。直接使用 Ubuntu 的 `/usr/bin/python3`，Python 包安装到当前用户的 `~/.local/`。运行无需 `env-ubuntu24.sh`。AWS 多区域测试请阅读 [远程部署说明](README_AWS_UBUNTU24_CN.md)。
 
 ## 快速运行
 
@@ -69,7 +69,7 @@ cargo build --locked --release --features benchmark
 - 检出提交：`3257759165a2f9ec09157509294146adcc0c2393`，提交日期 2022-06-17。
 - 保留原始 Rust 1.60.0、Cargo.lock、共识/网络/存储 Rust 源码。上游分支内部仍有 tusk 命名；此适配不另行替换算法。
 - 目标：Ubuntu 24.04、系统 Python 3.12、GCC/G++ 12、Clang/libclang 14。
-- 本地最小依赖支持 `fab local`、`fab logs`。AWS 和绘图任务仍在源码中，但不在此安装脚本的依赖范围。
+- 本地最小依赖支持 `fab local`、`fab logs`。AWS 和绘图任务使用已更新的 `benchmark/requirements.txt`，不在本地安装脚本的依赖范围。
 - 保留上游 GitHub Actions 文件；新仓库的 Actions 初始关闭，未启用上游每日构建和自动评论任务。
 
 ## 参数和输出
@@ -101,7 +101,7 @@ Python 依赖安装命令（在项目根目录）：
 
 Ubuntu 24.04 的系统 Python 有 externally-managed 标记，因此仅在这次 pip 调用中显式使用 `--break-system-packages`，并用 `--user` 安装到当前用户目录。它不会写入 `/usr/lib/python3/dist-packages`，但用户包可能影响当前用户的其他 Python 程序。不会删除系统标记文件，也不会全局设置 pip 的 break-system-packages。
 
-不要为本地运行安装原始 `benchmark/requirements.txt` 中的旧版依赖。这里只安装新版 Fabric/Invoke、Paramiko、原接口的 multiaddr 和 python-dateutil；matplotlib、boto3 延迟到相应任务执行时才导入。
+本地运行只需要 `benchmark/requirements-local.txt`。完整的 `benchmark/requirements.txt` 现在复用这些版本并添加 boto3、matplotlib；这两个包延迟到 AWS 或绘图任务执行时才导入。
 
 ## 修改内容
 

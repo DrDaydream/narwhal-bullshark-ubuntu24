@@ -2,12 +2,16 @@
 from collections import OrderedDict
 from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
-from paramiko import RSAKey
-from paramiko.ssh_exception import PasswordRequiredException, SSHException
+from invoke.exceptions import Failure
+from paramiko import PKey
+from paramiko.ssh_exception import AuthenticationException, PasswordRequiredException, SSHException
 from os.path import basename, splitext
-from time import sleep
+from time import monotonic, sleep
 from math import ceil
 from copy import deepcopy
+from itertools import zip_longest
+from pathlib import Path
+from shlex import quote
 import subprocess
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
@@ -22,8 +26,9 @@ class FabricError(Exception):
 
     def __init__(self, error):
         assert isinstance(error, GroupException)
-        message = list(error.result.values())[-1]
-        super().__init__(message)
+        failures = [f'{host.host}: {result}' for host, result in error.result.items()
+                    if isinstance(result, Exception)]
+        super().__init__('\n'.join(failures) or str(error))
 
 
 class ExecutionError(Exception):
@@ -31,15 +36,19 @@ class ExecutionError(Exception):
 
 
 class Bench:
+    TMUX_SOCKET = 'bullshark-benchmark'
+
     def __init__(self, ctx):
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
         try:
-            ctx.connect_kwargs.pkey = RSAKey.from_private_key_file(
-                self.manager.settings.key_path
+            self.connect = dict(getattr(ctx, 'connect_kwargs', {}))
+            self.connect.update(
+                pkey=PKey.from_path(Path(self.settings.key_path).expanduser()),
+                allow_agent=False, look_for_keys=False,
+                banner_timeout=30, auth_timeout=30,
             )
-            self.connect = ctx.connect_kwargs
-        except (IOError, PasswordRequiredException, SSHException) as e:
+        except (OSError, ValueError, PasswordRequiredException, SSHException) as e:
             raise BenchError('Failed to load SSH key', e)
 
     def _check_stderr(self, output):
@@ -51,43 +60,124 @@ class Bench:
             if output.stderr:
                 raise ExecutionError(output.stderr)
 
-    def install(self):
-        Print.info('Installing rust and cloning the repo...')
-        cmd = [
-            'sudo apt-get update',
-            'sudo apt-get -y upgrade',
-            'sudo apt-get -y autoremove',
+    @staticmethod
+    def _dependency_command():
+        # Match rust-toolchain and .cargo/config. Do not change the user's
+        # default Rust toolchain (the controller may also run Orca-B).
+        return r'''set -euo pipefail
+. /etc/os-release
+if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
+    echo "Bullshark AWS setup requires Ubuntu 24.04" >&2
+    exit 1
+fi
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+packages=(build-essential gcc-12 g++-12 clang-14 libclang-14-dev cmake
+          pkg-config libssl-dev zlib1g-dev protobuf-compiler tmux git curl
+          ca-certificates chrony)
+missing=0
+for package in "${packages[@]}"; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+        missing=1
+    fi
+done
+if [[ "$missing" == 1 ]]; then
+    sudo -n apt-get -o DPkg::Lock::Timeout=300 update
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y software-properties-common
+    sudo -n add-apt-repository -y universe
+    sudo -n apt-get -o DPkg::Lock::Timeout=300 update
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends "${packages[@]}"
+fi
+if ! command -v rustup >/dev/null 2>&1; then
+    installer=$(mktemp)
+    trap 'rm -f -- "$installer"' EXIT
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$installer"
+    sh "$installer" -y --profile minimal --default-toolchain none
+    rm -f -- "$installer"
+    trap - EXIT
+fi
+if ! rustup run 1.60.0 rustc --version >/dev/null 2>&1; then
+    rustup toolchain install 1.60.0 --profile minimal
+fi
+sudo -n systemctl enable --now chrony
+chronyc waitsync 60 0.01 0.0 1
+'''
 
-            # The following dependencies prevent the error: [error: linker `cc` not found].
-            'sudo apt-get -y install build-essential',
-            'sudo apt-get -y install cmake',
-
-            # Install rust (non-interactive).
-            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
-            'source $HOME/.cargo/env',
-            'rustup default stable',
-
-            # This is missing from the Rocksdb installer (needed for Rocksdb).
-            'sudo apt-get install -y clang',
-
-            # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
+    def _repository_command(self, revision=None):
+        repo, url, branch = map(quote, (
+            self.settings.repo_name, self.settings.repo_url, self.settings.branch,
+        ))
+        commands = [
+            f'if [ ! -d {repo}/.git ]; then git clone --no-checkout -- {url} {repo}; fi',
+            f'git -C {repo} remote set-url origin {url}',
+            f'git -C {repo} fetch --force origin {branch}',
         ]
-        hosts = self.manager.hosts(flat=True)
+        if revision is not None:
+            # A published controller commit must belong to the configured
+            # branch. Every worker builds exactly this commit, even if the
+            # branch advances while the testbed is being installed.
+            commands.append(f'git -C {repo} merge-base --is-ancestor {quote(revision)} FETCH_HEAD')
+        commands.append(f'git -C {repo} checkout --detach --force {quote(revision or "FETCH_HEAD")}')
+        return ' && '.join(commands)
+
+    @staticmethod
+    def _controller_revision():
+        root = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=PathMaker.node_crate_path(), text=True,
+        ).strip()
+        changed = subprocess.check_output(
+            ['git', 'status', '--porcelain', '--untracked-files=all', '--',
+             '*.rs', '*.proto', '*.toml', 'Cargo.lock', 'rust-toolchain*', '.cargo'],
+            cwd=root, text=True,
+        ).strip()
+        if changed:
+            raise BenchError('Commit and push build-source changes before fab remote',
+                             RuntimeError(changed))
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                                       cwd=root, text=True).strip()
+
+    def _wait_for_ssh(self, hosts):
+        for host in hosts:
+            deadline = monotonic() + 180
+            while True:
+                try:
+                    with Connection(host, user='ubuntu', connect_kwargs=self.connect,
+                                    connect_timeout=10) as connection:
+                        connection.open()
+                    break
+                except AuthenticationException:
+                    raise
+                except (OSError, SSHException):
+                    if monotonic() >= deadline:
+                        raise
+                    sleep(5)
+
+    def install(self, hosts=None):
+        hosts = self.manager.hosts(flat=True) if hosts is None else hosts
+        if not hosts:
+            raise BenchError('No running Bullshark instances found',
+                             RuntimeError('Run fab info; create or start the testbed first'))
+        Print.info('Preparing Ubuntu 24.04, Rust 1.60.0, GCC 12, Clang 14 and chrony...')
         try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
-            g.run(' && '.join(cmd), hide=True)
+            subprocess.run(['bash', '-lc', self._dependency_command()], check=True)
+            self._wait_for_ssh(hosts)
+            command = self._dependency_command() + '\n' + self._repository_command()
+            with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                       connect_timeout=15) as group:
+                group.run(f'bash -lc {quote(command)}', hide=True)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
-        except (GroupException, ExecutionError) as e:
+        except (GroupException, subprocess.SubprocessError, OSError, SSHException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to install repo on testbed', e)
 
-    def kill(self, hosts=[], delete_logs=False):
+    def kill(self, hosts=None, delete_logs=False):
+        hosts = self.manager.hosts(flat=True) if hosts is None else hosts
         assert isinstance(hosts, list)
         assert isinstance(delete_logs, bool)
-        hosts = hosts if hosts else self.manager.hosts(flat=True)
+        if not hosts:
+            return
         delete_logs = CommandMaker.clean_logs() if delete_logs else 'true'
-        cmd = [delete_logs, f'({CommandMaker.kill()} || true)']
+        cmd = [delete_logs, f'(tmux -L {self.TMUX_SOCKET} kill-server || true)']
         try:
             g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=True)
@@ -105,8 +195,8 @@ class Bench:
                 return []
 
             # Select the hosts in different data centers.
-            ordered = zip(*hosts.values())
-            ordered = [x for y in ordered for x in y]
+            ordered = zip_longest(*hosts.values())
+            ordered = [x for y in ordered for x in y if x is not None]
             return ordered[:nodes]
 
         # Spawn the primary and each worker on a different machine. Each
@@ -131,7 +221,9 @@ class Bench:
 
     def _background_run(self, host, command, log_file):
         name = splitext(basename(log_file))[0]
-        cmd = f'tmux new -d -s "{name}" "{command} |& tee {log_file}"'
+        script = f'exec {command} > {quote(log_file)} 2>&1'
+        cmd = (f'tmux -L {self.TMUX_SOCKET} new-session -d -s {quote(name)} '
+               f'{quote("bash -lc " + quote(script))}')
         c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
@@ -142,36 +234,42 @@ class Bench:
         else:
             ips = list(set([x for y in hosts for x in y]))
 
-        Print.info(
-            f'Updating {len(ips)} machines (branch "{self.settings.branch}")...'
-        )
+        revision = self.revision
+        Print.info(f'Building controller commit {revision} on {len(ips)} machines...')
+        repo = quote(self.settings.repo_name)
         cmd = [
-            f'(cd {self.settings.repo_name} && git fetch -f)',
-            f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
-            f'(cd {self.settings.repo_name} && git pull -f)',
-            'source $HOME/.cargo/env',
-            f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
-            CommandMaker.alias_binaries(
-                f'./{self.settings.repo_name}/target/release/'
-            )
+            self._repository_command(revision),
+            'export PATH="$HOME/.cargo/bin:$PATH"',
+            'unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC',
+            f'(cd {repo}/node && {CommandMaker.compile()})',
+            f'ln -sfn {repo}/target/release/node node',
+            f'ln -sfn {repo}/target/release/benchmark_client benchmark_client',
         ]
-        g = Group(*ips, user='ubuntu', connect_kwargs=self.connect)
-        g.run(' && '.join(cmd), hide=True)
+        with Group(*ips, user='ubuntu', connect_kwargs=self.connect) as group:
+            group.run(f'bash -lc {quote(" && ".join(cmd))}', hide=True)
+        Path(PathMaker.results_path()).mkdir(exist_ok=True)
+        Path(PathMaker.results_path(), 'remote-commit.txt').write_text(revision + '\n')
 
     def _config(self, hosts, node_parameters, bench_parameters):
         Print.info('Generating configuration files...')
+
+        if self._controller_revision() != self.revision:
+            raise BenchError('Controller commit changed during remote build',
+                             RuntimeError('Rerun fab remote from a stable checkout'))
 
         # Cleanup all local configuration files.
         cmd = CommandMaker.cleanup()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
         # Recompile the latest code.
-        cmd = CommandMaker.compile().split()
-        subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
+        cmd = ('export PATH="$HOME/.cargo/bin:$PATH"; '
+               'unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC; '
+               + CommandMaker.compile())
+        subprocess.run(['bash', '-lc', cmd], check=True, cwd=PathMaker.node_crate_path())
 
         # Create alias for the client and nodes binary.
         cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
-        subprocess.run([cmd], shell=True)
+        subprocess.run([cmd], shell=True, check=True)
 
         # Generate configuration files.
         keys = []
@@ -318,13 +416,22 @@ class Bench:
         # Select which hosts to use.
         selected_hosts = self._select_hosts(bench_parameters)
         if not selected_hosts:
-            Print.warn('There are not enough instances available')
-            return
+            raise BenchError('There are not enough running Bullshark instances',
+                             RuntimeError('Check fab info and the nodes/workers parameters'))
+
+        ips = (selected_hosts if bench_parameters.collocate else
+               [ip for hosts in selected_hosts for ip in hosts])
+        try:
+            self.revision = self._controller_revision()
+        except (subprocess.SubprocessError, OSError) as e:
+            raise BenchError('Failed to identify controller build sources', e)
+        # fab remote is also the first-run entry point; fab install is optional.
+        self.install(hosts=list(dict.fromkeys(ips)))
 
         # Update nodes.
         try:
             self._update(selected_hosts, bench_parameters.collocate)
-        except (GroupException, ExecutionError) as e:
+        except (GroupException, ExecutionError, subprocess.SubprocessError, OSError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to update nodes', e)
 
@@ -333,7 +440,7 @@ class Bench:
             committee = self._config(
                 selected_hosts, node_parameters, bench_parameters
             )
-        except (subprocess.SubprocessError, GroupException) as e:
+        except (subprocess.SubprocessError, GroupException, Failure, OSError, SSHException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to configure nodes', e)
 
@@ -363,9 +470,12 @@ class Bench:
                             r,
                             bench_parameters.tx_size,
                         ))
-                    except (subprocess.SubprocessError, GroupException, ParseError) as e:
-                        self.kill(hosts=selected_hosts)
+                    except KeyboardInterrupt:
+                        self.kill(hosts=ips)
+                        raise
+                    except (subprocess.SubprocessError, GroupException, Failure, ParseError,
+                            ExecutionError, OSError, SSHException) as e:
+                        self.kill(hosts=ips)
                         if isinstance(e, GroupException):
                             e = FabricError(e)
-                        Print.error(BenchError('Benchmark failed', e))
-                        continue
+                        raise BenchError('Benchmark failed', e)

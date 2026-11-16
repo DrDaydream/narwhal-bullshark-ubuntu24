@@ -1,16 +1,16 @@
 {
     "key": {
-        "name": "aws-sui",
-        "path": "/Users/username/.ssh/aws-sui.pem"
+        "name": "orca-amazon",
+        "path": "/home/ubuntu/.ssh/orca-amazon.pem"
     },
-    "port": 5000,
+    "port": 3000,
     "repo": {
-        "name": "narwhal",
-        "url": "https://github.com/mystenlabs/narwhal",
+        "name": "narwhal-bullshark-ubuntu24",
+        "url": "https://github.com/DrDaydream/narwhal-bullshark-ubuntu24.git",
         "branch": "main"
     },
     "instances": {
-        "type": "m5d.8xlarge",
+        "type": "m5.8xlarge",
         "regions": [
             "us-east-1",
             "eu-north-1",

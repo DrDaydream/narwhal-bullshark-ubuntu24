@@ -17,8 +17,9 @@ class AWSError(Exception):
 
 
 class InstanceManager:
-    INSTANCE_NAME = 'dag-node'
-    SECURITY_GROUP_NAME = 'dag'
+    # Keep lifecycle commands separate from the Orca-B testbed.
+    INSTANCE_NAME = 'bullshark-node'
+    SECURITY_GROUP_NAME = 'bullshark'
 
     def __init__(self, settings):
         assert isinstance(settings, Settings)
@@ -39,7 +40,7 @@ class InstanceManager:
         # 'terminated', 'stopping', and 'stopped'.
         ids, ips = defaultdict(list), defaultdict(list)
         for region, client in self.clients.items():
-            r = client.describe_instances(
+            pages = client.get_paginator('describe_instances').paginate(
                 Filters=[
                     {
                         'Name': 'tag:Name',
@@ -51,7 +52,10 @@ class InstanceManager:
                     }
                 ]
             )
-            instances = [y for x in r['Reservations'] for y in x['Instances']]
+            instances = [instance for page in pages
+                         for reservation in page['Reservations']
+                         for instance in reservation['Instances']]
+            instances.sort(key=lambda instance: instance['InstanceId'])
             for x in instances:
                 ids[region] += [x['InstanceId']]
                 if 'PublicIpAddress' in x:
@@ -69,7 +73,7 @@ class InstanceManager:
 
     def _create_security_group(self, client):
         client.create_security_group(
-            Description='HotStuff node',
+            Description='Bullshark benchmark node',
             GroupName=self.SECURITY_GROUP_NAME,
         )
 
@@ -106,14 +110,22 @@ class InstanceManager:
         )
 
     def _get_ami(self, client):
-        # The AMI changes with regions.
+        # Canonical's current Noble image is different in each AWS region.
         response = client.describe_images(
-            Filters=[{
-                'Name': 'description',
-                'Values': ['Canonical, Ubuntu, 20.04 LTS, amd64 focal image build on 2020-10-26']
-            }]
+            Owners=['099720109477'],
+            Filters=[
+                {'Name': 'name', 'Values': ['ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*']},
+                {'Name': 'state', 'Values': ['available']},
+                {'Name': 'architecture', 'Values': ['x86_64']},
+                {'Name': 'root-device-type', 'Values': ['ebs']},
+                {'Name': 'virtualization-type', 'Values': ['hvm']},
+            ],
         )
-        return response['Images'][0]['ImageId']
+        images = response.get('Images', [])
+        if not images:
+            raise BenchError('No Canonical Ubuntu 24.04 amd64 AMI found',
+                             RuntimeError(client.meta.region_name))
+        return max(images, key=lambda image: image['CreationDate'])['ImageId']
 
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0
@@ -152,7 +164,7 @@ class InstanceManager:
                     BlockDeviceMappings=[{
                         'DeviceName': '/dev/sda1',
                         'Ebs': {
-                            'VolumeType': 'gp2',
+                            'VolumeType': 'gp3',
                             'VolumeSize': 200,
                             'DeleteOnTermination': True
                         }
@@ -214,11 +226,11 @@ class InstanceManager:
             size = sum(len(x) for x in ids.values())
             Print.heading(f'Stopping {size} instances')
         except ClientError as e:
-            raise BenchError(AWSError(e))
+            raise BenchError('Failed to stop instances', AWSError(e))
 
     def hosts(self, flat=False):
         try:
-            _, ips = self._get(['pending', 'running'])
+            _, ips = self._get(['running'])
             return [x for y in ips.values() for x in y] if flat else ips
         except ClientError as e:
             raise BenchError('Failed to gather instances IPs', AWSError(e))

@@ -112,12 +112,13 @@ def seed(ctx, starting_data_port):
 
 @task
 def create(ctx, nodes=2):
-    ''' Create a testbed'''
+    ''' Create `nodes` new machines in EACH configured AWS region '''
     from benchmark.instance import InstanceManager
     try:
         InstanceManager.make().create_instances(nodes)
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
@@ -128,6 +129,7 @@ def destroy(ctx):
         InstanceManager.make().terminate_instances()
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
@@ -138,6 +140,7 @@ def start(ctx, max=2):
         InstanceManager.make().start_instances(max)
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
@@ -148,6 +151,7 @@ def stop(ctx):
         InstanceManager.make().stop_instances()
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
@@ -158,31 +162,38 @@ def info(ctx):
         InstanceManager.make().print_info()
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
 def install(ctx):
-    ''' Install the codebase on all machines '''
+    ''' Prepare Ubuntu 24.04 controller/workers and clone the configured repo '''
     from benchmark.remote import Bench
     try:
         Bench(ctx).install()
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
-def remote(ctx, debug=False):
-    ''' Run benchmarks on AWS '''
+def remote(ctx, debug=False, nodes=20, workers=1, rate=50_000, tx_size=512,
+           duration=80, faults=0, runs=1):
+    ''' Install, build and run a collocated Bullshark benchmark on AWS '''
     from benchmark.remote import Bench
+    if nodes < 2 or workers < 1 or duration < 1 or rate < 0 or tx_size < 9 or runs < 1:
+        raise Exit('Require nodes >= 2, workers >= 1, duration >= 1, rate >= 0, tx-size >= 9, runs >= 1.', code=2)
+    if not 0 <= faults < nodes:
+        raise Exit('Require 0 <= faults < nodes.', code=2)
     bench_params = {
-        'faults': 3,
-        'nodes': [10],
-        'workers': 1,
+        'faults': faults,
+        'nodes': [nodes],
+        'workers': workers,
         'collocate': True,
-        'rate': [10_000, 110_000],
-        'tx_size': 512,
-        'duration': 300,
-        'runs': 2,
+        'rate': [rate],
+        'tx_size': tx_size,
+        'duration': duration,
+        'runs': runs,
     }
     node_params = {
         'header_size': 1_000,  # bytes
@@ -191,6 +202,7 @@ def remote(ctx, debug=False):
         'sync_retry_delay': '10_000ms',  # ms
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
+        'max_batch_delay': '200ms',
         'block_synchronizer': {
             'certificates_synchronize_timeout': '2_000ms',
             'payload_synchronize_timeout': '2_000ms',
@@ -208,6 +220,7 @@ def remote(ctx, debug=False):
         Bench(ctx).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task
@@ -236,6 +249,7 @@ def kill(ctx):
         Bench(ctx).kill()
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1) from e
 
 
 @task

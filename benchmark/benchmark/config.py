@@ -1,6 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from json import dump, load
 from collections import OrderedDict
+from urllib.parse import urlsplit
 from benchmark.utils import multiaddr_to_url_data
 
 
@@ -150,9 +151,14 @@ class Committee:
 
     @staticmethod
     def ip(multi_address):
-        address = multiaddr_to_url_data(multi_address)
-        assert isinstance(address, str)
-        return address.split(':')[0]
+        # Committee JSON contains multiaddrs; the client-facing accessors
+        # return HTTP URLs. SSH needs the hostname from either representation.
+        address = (multiaddr_to_url_data(multi_address)
+                   if multi_address.startswith('/') else multi_address)
+        host = urlsplit(address).hostname
+        if not host:
+            raise ConfigError(f'Address has no hostname: {multi_address}')
+        return host
 
 
 class LocalCommittee(Committee):

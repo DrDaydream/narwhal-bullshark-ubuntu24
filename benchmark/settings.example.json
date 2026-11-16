@@ -1,0 +1,22 @@
+{
+    "key": {
+        "name": "orca-amazon",
+        "path": "/home/ubuntu/.ssh/orca-amazon.pem"
+    },
+    "port": 3000,
+    "repo": {
+        "name": "narwhal-bullshark-ubuntu24",
+        "url": "https://github.com/DrDaydream/narwhal-bullshark-ubuntu24.git",
+        "branch": "main"
+    },
+    "instances": {
+        "type": "m5.8xlarge",
+        "regions": [
+            "us-east-1",
+            "eu-north-1",
+            "ap-southeast-2",
+            "us-west-1",
+            "ap-northeast-1"
+        ]
+    }
+}
