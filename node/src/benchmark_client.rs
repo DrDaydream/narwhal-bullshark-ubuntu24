@@ -6,6 +6,7 @@ use bytes::{BufMut as _, BytesMut};
 use clap::{crate_name, crate_version, App, AppSettings};
 use futures::{future::join_all, StreamExt};
 use rand::Rng;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::TcpStream,
     time::{interval, sleep, Duration, Instant},
@@ -42,6 +43,8 @@ async fn main() -> Result<()> {
     let subscriber = subscriber_builder.with_writer(std::io::stderr).finish();
 
     set_global_default(subscriber).expect("Failed to set subscriber");
+
+    info!("Benchmark latency instrumentation version 1");
 
     let target_str = matches.value_of("ADDR").unwrap();
     let target = target_str
@@ -124,6 +127,17 @@ impl Client {
         'main: loop {
             interval.as_mut().tick().await;
             let now = Instant::now();
+
+            // Record burst release before the stream lazily constructs the sample.
+            if burst > 0 {
+                if let Ok(released_at) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                    info!(
+                        "Benchmark sample released id {} at_us {}",
+                        counter,
+                        released_at.as_micros()
+                    );
+                }
+            }
 
             let mut tx = BytesMut::with_capacity(self.size);
             let size = self.size;

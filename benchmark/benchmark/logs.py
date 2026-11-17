@@ -10,6 +10,7 @@ from statistics import mean
 
 
 from benchmark.utils import Print
+from benchmark.measurements import Measurements, format_measurements
 
 
 class ParseError(Exception):
@@ -65,6 +66,12 @@ class LogParser:
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
+        # Observational statistics keep final commit times per replica.
+        try:
+            self.measurements = Measurements(clients, primaries, workers)
+        except ValueError as error:
+            raise ParseError(str(error)) from error
+
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
 
@@ -73,6 +80,15 @@ class LogParser:
             Print.warn(
                 f'Clients missed their target rate {self.misses:,} time(s)'
             )
+
+    def measurement_metrics(self, duration=None, warmup=0, drain=0):
+        """Paired release/ingress -> final latency and optional ABA byte/s.
+
+        Explicit duration uses [first client Start + warmup, Start + warmup
+        + duration). Without it, the observed log span is labelled as such.
+        No runner, workload, or protocol behavior is changed by this parser.
+        """
+        return self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
 
     def _merge_results(self, input):
         # Keep the earliest timestamp.
@@ -210,6 +226,9 @@ class LogParser:
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
+        measurements = self.measurement_metrics()
+        main_ms = measurements['pooled']['release_to_final']['mean_ms']
+        main_latency = f'{main_ms:,.3f}' if main_ms is not None else 'N/A'
 
         return (
             '\n'
@@ -241,21 +260,36 @@ class LogParser:
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
-            '-----------------------------------------\n'
+            f' Legacy send-based latency: {round(end_to_end_latency):,} ms\n'
+            f' End-to-end latency: {main_latency} ms\n'
+            + format_measurements(measurements)
+            + '-----------------------------------------\n'
         )
 
     def print(self, filename):
         assert isinstance(filename, str)
         with open(filename, 'a') as f:
             f.write(self.result())
+        # Append one machine-readable record per run; existing runners
+        # can keep their filenames and repeated-run behavior.
+        from json import dump
+        with open(filename + '.metrics.jsonl', 'a', encoding='utf-8') as output:
+            dump(self.measurement_metrics(), output, allow_nan=False)
+            output.write('\n')
 
     @classmethod
     def process(cls, directory, faults=0):
         assert isinstance(directory, str)
 
+        client_files = sorted(glob(join(directory, 'client-*.log')))
+        worker_files = sorted(glob(join(directory, 'worker-*.log')))
+        if [x.rsplit('client-', 1)[1] for x in client_files] != [
+            x.rsplit('worker-', 1)[1] for x in worker_files
+        ]:
+            raise ParseError('Client and worker log identities do not match')
+
         clients = []
-        for filename in sorted(glob(join(directory, 'client-*.log'))):
+        for filename in client_files:
             with open(filename, 'r') as f:
                 clients += [f.read()]
         primaries = []
@@ -263,11 +297,16 @@ class LogParser:
             with open(filename, 'r') as f:
                 primaries += [f.read()]
         workers = []
-        for filename in sorted(glob(join(directory, 'worker-*.log'))):
+        for filename in worker_files:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 
-        return cls(clients, primaries, workers, faults=faults)
+        result = cls(clients, primaries, workers, faults=faults)
+        result.measurements.source_logs = [
+            {'client': c, 'worker': w} for c, w in zip(client_files, worker_files)
+        ]
+        result.measurements.replica_logs = sorted(glob(join(directory, 'primary-*.log')))
+        return result
 
 
 class LogGrpcParser:

@@ -12,6 +12,8 @@ use crypto::traits::VerifyingKey;
 use futures::{Stream, StreamExt};
 use multiaddr::{Multiaddr, Protocol};
 use primary::{PrimaryWorkerMessage, WorkerPrimaryMessage};
+#[cfg(feature = "benchmark")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{net::Ipv4Addr, pin::Pin};
 use store::Store;
 use tokio::{
@@ -93,6 +95,9 @@ impl<PublicKey: VerifyingKey> Worker<PublicKey> {
                 .expect("Our public key or worker id is not in the committee")
                 .transactions
         );
+
+        #[cfg(feature = "benchmark")]
+        info!("Benchmark latency instrumentation version 1");
 
         handle
     }
@@ -245,6 +250,22 @@ struct TxReceiverHandler {
 }
 
 impl TxReceiverHandler {
+    #[cfg(feature = "benchmark")]
+    fn log_sample_ingress(transaction: &[u8]) {
+        if transaction.len() >= 9 && transaction[0] == 0 {
+            if let Ok(received_at) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                let mut id_bytes = [0u8; 8];
+                id_bytes.copy_from_slice(&transaction[1..9]);
+                let id = u64::from_be_bytes(id_bytes);
+                info!(
+                    "Benchmark sample ingress id {} at_us {}",
+                    id,
+                    received_at.as_micros()
+                );
+            }
+        }
+    }
+
     fn spawn(self, address: Multiaddr) {
         tokio::spawn(async move {
             let config = mysten_network::config::Config::new();
@@ -267,6 +288,8 @@ impl Transactions for TxReceiverHandler {
         request: Request<TransactionProto>,
     ) -> Result<Response<Empty>, Status> {
         let message = request.into_inner().transaction;
+        #[cfg(feature = "benchmark")]
+        Self::log_sample_ingress(&message);
         // Send the transaction to the batch maker.
         self.tx_batch_maker
             .send(message.to_vec())
@@ -283,6 +306,8 @@ impl Transactions for TxReceiverHandler {
         let mut transactions = request.into_inner();
 
         while let Some(Ok(txn)) = transactions.next().await {
+            #[cfg(feature = "benchmark")]
+            Self::log_sample_ingress(&txn.transaction);
             // Send the transaction to the batch maker.
             self.tx_batch_maker
                 .send(txn.transaction.to_vec())
