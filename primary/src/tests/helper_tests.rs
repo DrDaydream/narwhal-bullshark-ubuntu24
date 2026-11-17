@@ -34,6 +34,7 @@ async fn test_process_certificates_stream_mode() {
         certificate_store.clone(),
         payload_store.clone(),
         rx_primaries,
+        None,
     );
 
     // AND some mock certificates
@@ -105,6 +106,7 @@ async fn test_process_certificates_batch_mode() {
         certificate_store.clone(),
         payload_store.clone(),
         rx_primaries,
+        None,
     );
 
     // AND some mock certificates
@@ -197,6 +199,7 @@ async fn test_process_payload_availability_success() {
         certificate_store.clone(),
         payload_store.clone(),
         rx_primaries,
+        None,
     );
 
     // AND some mock certificates
@@ -309,6 +312,7 @@ async fn test_process_payload_availability_when_failures() {
         certificate_store.clone(),
         payload_store.clone(),
         rx_primaries,
+        None,
     );
 
     // AND some mock certificates

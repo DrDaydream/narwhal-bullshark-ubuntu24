@@ -1,5 +1,6 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+use crate::adversary::{Adversary, ScheduledNetwork};
 use crate::{
     block_synchronizer::{
         peers::Peers,
@@ -169,7 +170,7 @@ pub struct BlockSynchronizer<PublicKey: VerifyingKey> {
         HashMap<RequestID, Sender<PayloadAvailabilityResponse<PublicKey>>>,
 
     /// Send network requests
-    primary_network: PrimaryNetwork,
+    primary_network: ScheduledNetwork<PublicKey>,
     worker_network: PrimaryToWorkerNetwork,
 
     /// The store that holds the certificates
@@ -200,6 +201,32 @@ impl<PublicKey: VerifyingKey> BlockSynchronizer<PublicKey> {
         certificate_store: Store<CertificateDigest, Certificate<PublicKey>>,
         parameters: BlockSynchronizerParameters,
     ) {
+        Self::spawn_with_adversary(
+            name,
+            committee,
+            rx_commands,
+            rx_certificate_responses,
+            rx_payload_availability_responses,
+            network,
+            payload_store,
+            certificate_store,
+            parameters,
+            None,
+        );
+    }
+
+    pub(crate) fn spawn_with_adversary(
+        name: PublicKey,
+        committee: SharedCommittee<PublicKey>,
+        rx_commands: Receiver<Command<PublicKey>>,
+        rx_certificate_responses: Receiver<CertificatesResponse<PublicKey>>,
+        rx_payload_availability_responses: Receiver<PayloadAvailabilityResponse<PublicKey>>,
+        network: PrimaryNetwork,
+        payload_store: Store<(BatchDigest, WorkerId), PayloadToken>,
+        certificate_store: Store<CertificateDigest, Certificate<PublicKey>>,
+        parameters: BlockSynchronizerParameters,
+        adversary: Option<std::sync::Arc<Adversary<PublicKey>>>,
+    ) {
         tokio::spawn(async move {
             Self {
                 name,
@@ -210,7 +237,7 @@ impl<PublicKey: VerifyingKey> BlockSynchronizer<PublicKey> {
                 pending_requests: HashMap::new(),
                 map_certificate_responses_senders: HashMap::new(),
                 map_payload_availability_responses_senders: HashMap::new(),
-                primary_network: network,
+                primary_network: ScheduledNetwork::new(network, adversary),
                 worker_network: PrimaryToWorkerNetwork::default(),
                 payload_store,
                 certificate_store,

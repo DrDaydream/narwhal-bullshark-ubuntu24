@@ -428,7 +428,7 @@ async fn test_multiple_overlapping_requests() {
         pending_requests: HashMap::new(),
         map_certificate_responses_senders: HashMap::new(),
         map_payload_availability_responses_senders: HashMap::new(),
-        primary_network: PrimaryNetwork::default(),
+        primary_network: PrimaryNetwork::default().into(),
         worker_network: PrimaryToWorkerNetwork::default(),
         payload_store,
         certificate_store,

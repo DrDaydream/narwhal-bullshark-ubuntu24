@@ -22,6 +22,13 @@ pub use crate::{
 #[must_use]
 pub struct CancelHandler<T>(tokio::task::JoinHandle<T>);
 
+impl<T> CancelHandler<T> {
+    /// Transfer ownership of a task into an abort-on-drop handle.
+    pub fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+}
+
 impl<T> Drop for CancelHandler<T> {
     fn drop(&mut self) {
         self.0.abort();

@@ -1,0 +1,67 @@
+# Bullshark scheduling adversaries
+
+From the controller's `benchmark/` directory, after choosing the desired existing deployment branch/commit in the normal repository workflow:
+
+The controller's committed `HEAD` must be fetchable by the AWS machines from the deployment repository and branch configured in `settings.json`. Bullshark also checks that this commit belongs to the fetched branch's history. This delivery provides local feature branches and patches/Git bundles, and does not push the commits to a remote repository. Publish the chosen commit to the configured deployment branch before running the AWS workflow, or apply the patch there, commit it, and check out that published commit on the controller. A branch or bundle present only on the local machine is not automatically available to the AWS machines.
+
+```bash
+fab create --nodes 4
+fab install
+fab remote --nodes 4 --workers 1 --rate 10000 --tx-size 512 --duration 60 --faults 0 --runs 1 --adversary none
+fab remote --nodes 4 --rate 10000 --duration 60 --faults 0 --runs 1 --adversary silent --byzantine 0 --bullshark-alternating true --seed 7 --start-round 1 --attack-rounds 40
+fab remote --nodes 4 --rate 10000 --duration 60 --faults 0 --runs 1 --adversary targeted --byzantine-ids 1 --bullshark-alternating false --seed 7 --delay-ms 200
+fab remote --nodes 4 --rate 10000 --duration 60 --faults 0 --runs 1 --adversary network --byzantine 0 --bullshark-alternating false --seed 7 --delay-ms 200
+```
+
+`create --nodes 4` requests four machines in each configured region; `remote --nodes 4` selects a four-authority committee from the existing testbed. Only create the machines required by your chosen regional layout.
+
+Without `--adversary`, Bullshark preserves `nodes=20`, `workers=1`, `rate=50000`, `tx_size=512`, `duration=80`, `faults=0`, and `runs=1`. Its `faults` option retains its original meaning: the final launch IDs are inactive crashed processes. Fixed Byzantine IDs cannot overlap those inactive IDs.
+
+Enabled modes default to strict alternating leader slots. Global round 2 is normal, round 4 is unavailable, round 6 is normal, round 8 is unavailable, and this parity continues. `start-round` filters the global schedule; it does not restart the parity. On unavailable slots, the selected leader suppresses its proposal before signing, including when that leader lies outside the fixed Byzantine set. On normal slots, the leader is allowed to propose even if it lies in a silent fixed Byzantine set; its own signed evidence for that slot is also exempt from fixed-set silence. Other fixed Byzantine traffic remains governed by the selected mode. A normal slot permits a proposal; it does not guarantee a commit.
+
+This model combines a fixed Byzantine set with temporary faults at selected leader slots. The fixed set is bounded by `f`, but an unavailable honest leader can add a fault outside that set. This is a stronger experiment model than a fixed Byzantine set alone; no aggregate `f` bound is asserted. The second example isolates the exact normal/unavailable alternation with an empty fixed set. To run only the fixed-set or network schedule, pass `--bullshark-alternating false`. With alternation disabled, `silent` and `targeted` need a nonempty fixed set. Explicit `none/A0` disables alternation and all other injection.
+
+The existing controller workflow remains `fab create`, `fab install`, then `fab remote`. Run these commands from `benchmark/` with your existing `settings.json`. For Bullshark, `fab install` prepares dependencies, fetches the configured branch, and builds the controller's exact commit both locally and on the AWS machines. `fab remote` checks the commit build stamps and uses those binaries without building. Run `fab install` after changing the deployed commit; changing only adversary parameters requires another `fab remote` while the matching builds remain available. Use `fab --help remote` to inspect the parameters.
+
+A mode is opt-in. Omitting `--adversary` keeps the old run defaults and legacy fault behavior. Explicit `--adversary none` (alias `A0`) is the no-injection baseline. The only aliases are:
+
+| Mode | Alias | Behavior |
+| --- | --- | --- |
+| `none` | `A0` | No scheduling injection. |
+| `silent` | `A1` | Fixed Byzantine authorities suppress proposals and selected primary protocol sends during the attack window. |
+| `targeted` | `A3` | Fixed Byzantine senders use a deterministic, leader-dependent recipient schedule to delay valid signed evidence. |
+| `network` | `A5` | The delivery schedule can also delay sends from honest authorities. An empty fixed Byzantine set is allowed. |
+
+`targeted` is selective scheduling of existing valid messages. It does not generate conflicting signed proposals or implement an equivocation/fork attack. A2 and A4 are not implemented aliases. Scheduling changes delivery and proposal emission; signatures, certificate checks, quorum thresholds, and consensus commit rules keep their original meaning.
+
+The common experiment flags are `--nodes`, `--workers`, `--rate`, `--tx-size`, `--duration`, `--faults`, and `--runs`. `--nodes` takes one count. `--rate 10000,50000` runs those input rates in order. All new mode commands default to `faults=0` if the option is omitted.
+
+| Adversary option | Default | Meaning |
+| --- | --- | --- |
+| `--byzantine` | `0` | Fixed Byzantine count; selects launch IDs `0..count-1`. |
+| `--byzantine-ids` | empty | Explicit comma-separated launch IDs, e.g. `0,2`; use instead of a positive count. |
+| `--seed` | `1` | Deterministic scheduling seed, unsigned 64-bit integer. |
+| `--start-round` | `1` | First protocol round affected; at least 1. |
+| `--attack-rounds` | `0` | Window length; zero is unbounded. |
+| `--delay-ms` | `200` | Delay of selected sends, from 1 through 86,400,000 ms. |
+| `--max-pending-messages` | `4096` | Positive per-primary bound on admitted delayed messages, including sends still awaiting transport completion. |
+| `--max-pending-bytes` | `67108864` | Positive per-primary bound on their retained serialized message bytes. |
+| `--bullshark-alternating` | `true` | Bullshark only; accepts the value `true` or `false`. |
+
+The bounded window is `[start_round, start_round + attack_rounds)`; overflow is rejected. Queue bounds fit the 64-bit deployment target. Fixed Byzantine membership is selected once per committee: its size cannot exceed `f = floor((nodes - 1) / 3)`, IDs must be unique and in range, and they refer to key-generation/launch order (the ID used by `.node-<id>.json`), not a public-key sort order or a shortened display ID. Each primary receives the corresponding full public keys. Parameter errors are rejected before constructing the AWS manager.
+
+Every explicit-mode run writes a timestamped `results/*-n<N>-r<R>-run<I>.parameters.json` file before launch, including benchmark parameters, node parameters, the full launch-ID-to-public-key array, and resolved runtime configuration. The controller prints its path. Keep this file with the run's logs and normal performance results. A seed is deterministic for the same committee, parameters, and protocol rounds; `fab remote` generates new keys, so the seed alone is not a promise of the same identity-dependent schedule across fresh committees.
+
+The primary environment contains one shell-quoted `BENCH_ADVERSARY_CONFIG` JSON object with `mode`, `byzantine_authorities`, `seed`, `start_round`, `rounds`, `delay_ms`, `max_pending_messages`, `max_pending_bytes`, and `bullshark_alternating`. Fabric resolves aliases and launch IDs before passing it to Rust. The benchmark clients and workers continue to receive ordinary workload commands.
+
+An admitted delayed send remains counted until transport completion/acknowledgement. Its timer does not require new incoming messages, and later consensus garbage collection cannot discard it before release. When the scheduling budget is full, or a message exceeds its byte limit, that message goes immediately through the ordinary transport. The limits bound scheduling storage, not total node memory: the original transport and consensus buffers still exist, and a silent proposer may retain incoming worker batch digests until it can propose again.
+
+The runtime strategy is centralized in `primary/src/adversary.rs`. Python's `benchmark/benchmark/adversary.py` only validates experiment parameters, maps launch IDs to keys, and serializes the configuration. Supporting transport timers and queue accounting implement delivery mechanics; they do not choose adversary strategies.
+
+Offline Python validation, from `benchmark/` after installing the repository's normal Python requirements:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The new tests run the real Fabric argument parser, validate the config and ID mapping, capture real primary/client launch commands, and execute the nested shell command through Bash with a fake tmux/node boundary. They do not contact AWS.

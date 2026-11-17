@@ -1,6 +1,7 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+use crate::adversary::{Adversary, ScheduledNetwork};
 use crate::primary::{PayloadToken, PrimaryMessage, PrimaryWorkerMessage};
 use config::{SharedCommittee, WorkerId};
 use crypto::traits::VerifyingKey;
@@ -69,7 +70,7 @@ pub struct HeaderWaiter<PublicKey: VerifyingKey> {
     tx_core: Sender<Header<PublicKey>>,
 
     /// Network driver allowing to send messages.
-    primary_network: PrimaryNetwork,
+    primary_network: ScheduledNetwork<PublicKey>,
     worker_network: PrimaryToWorkerNetwork,
     /// Keeps the digests of the all certificates for which we sent a sync request,
     /// along with a time stamp (`u128`) indicating when we sent the request.
@@ -83,7 +84,7 @@ pub struct HeaderWaiter<PublicKey: VerifyingKey> {
 }
 
 impl<PublicKey: VerifyingKey> HeaderWaiter<PublicKey> {
-    pub fn spawn(
+    pub(crate) fn spawn(
         name: PublicKey,
         committee: SharedCommittee<PublicKey>,
         certificate_store: Store<CertificateDigest, Certificate<PublicKey>>,
@@ -94,6 +95,7 @@ impl<PublicKey: VerifyingKey> HeaderWaiter<PublicKey> {
         sync_retry_nodes: usize,
         rx_synchronizer: Receiver<WaiterMessage<PublicKey>>,
         tx_core: Sender<Header<PublicKey>>,
+        adversary: Option<Arc<Adversary<PublicKey>>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -107,7 +109,7 @@ impl<PublicKey: VerifyingKey> HeaderWaiter<PublicKey> {
                 sync_retry_nodes,
                 rx_synchronizer,
                 tx_core,
-                primary_network: Default::default(),
+                primary_network: ScheduledNetwork::new(PrimaryNetwork::default(), adversary),
                 worker_network: Default::default(),
                 parent_requests: HashMap::new(),
                 batch_requests: HashMap::new(),

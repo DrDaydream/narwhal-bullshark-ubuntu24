@@ -1,10 +1,15 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use crate::{primary::PrimaryMessage, PayloadToken};
+use crate::{
+    adversary::{Adversary, ScheduledNetwork},
+    primary::PrimaryMessage,
+    PayloadToken,
+};
 use config::{SharedCommittee, WorkerId};
 use crypto::traits::{EncodeDecodeBase64, VerifyingKey};
 use network::PrimaryNetwork;
+use std::sync::Arc;
 use store::{Store, StoreError};
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
@@ -41,16 +46,17 @@ pub struct Helper<PublicKey: VerifyingKey> {
     /// Input channel to receive requests.
     rx_primaries: Receiver<PrimaryMessage<PublicKey>>,
     /// A network sender to reply to the sync requests.
-    primary_network: PrimaryNetwork,
+    primary_network: ScheduledNetwork<PublicKey>,
 }
 
 impl<PublicKey: VerifyingKey> Helper<PublicKey> {
-    pub fn spawn(
+    pub(crate) fn spawn(
         name: PublicKey,
         committee: SharedCommittee<PublicKey>,
         certificate_store: Store<CertificateDigest, Certificate<PublicKey>>,
         payload_store: Store<(BatchDigest, WorkerId), PayloadToken>,
         rx_primaries: Receiver<PrimaryMessage<PublicKey>>,
+        adversary: Option<Arc<Adversary<PublicKey>>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -59,7 +65,7 @@ impl<PublicKey: VerifyingKey> Helper<PublicKey> {
                 certificate_store,
                 payload_store,
                 rx_primaries,
-                primary_network: PrimaryNetwork::default(),
+                primary_network: ScheduledNetwork::new(PrimaryNetwork::default(), adversary),
             }
             .run()
             .await;

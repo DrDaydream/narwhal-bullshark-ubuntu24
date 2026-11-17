@@ -2,6 +2,7 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
+    adversary::{Adversary, DeliveryHandle, ScheduledNetwork},
     aggregators::{CertificatesAggregator, VotesAggregator},
     primary::PrimaryMessage,
     synchronizer::Synchronizer,
@@ -9,7 +10,7 @@ use crate::{
 use async_recursion::async_recursion;
 use config::SharedCommittee;
 use crypto::{traits::VerifyingKey, Hash as _, SignatureService};
-use network::{CancelHandler, PrimaryNetwork};
+use network::PrimaryNetwork;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -77,13 +78,13 @@ pub struct Core<PublicKey: VerifyingKey> {
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator<PublicKey>>>,
     /// A network sender to send the batches to the other workers.
-    network: PrimaryNetwork,
+    network: ScheduledNetwork<PublicKey>,
     /// Keeps the cancel handlers of the messages we sent.
-    cancel_handlers: HashMap<Round, Vec<CancelHandler<()>>>,
+    cancel_handlers: HashMap<Round, Vec<DeliveryHandle>>,
 }
 
 impl<PublicKey: VerifyingKey> Core<PublicKey> {
-    pub fn spawn(
+    pub(crate) fn spawn(
         name: PublicKey,
         committee: SharedCommittee<PublicKey>,
         header_store: Store<HeaderDigest, Header<PublicKey>>,
@@ -98,6 +99,7 @@ impl<PublicKey: VerifyingKey> Core<PublicKey> {
         rx_proposer: Receiver<Header<PublicKey>>,
         tx_consensus: Sender<Certificate<PublicKey>>,
         tx_proposer: Sender<(Vec<CertificateDigest>, Round)>,
+        adversary: Option<Arc<Adversary<PublicKey>>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             Self {
@@ -121,7 +123,7 @@ impl<PublicKey: VerifyingKey> Core<PublicKey> {
                 current_header: Header::default(),
                 votes_aggregator: VotesAggregator::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
-                network: Default::default(),
+                network: ScheduledNetwork::new(PrimaryNetwork::default(), adversary),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()

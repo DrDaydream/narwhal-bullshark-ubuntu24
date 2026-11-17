@@ -1,8 +1,10 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+use crate::adversary::Adversary;
 use config::{SharedCommittee, WorkerId};
 use crypto::{traits::VerifyingKey, Digest, Hash as _, SignatureService};
+use std::sync::Arc;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::{sleep, Duration, Instant},
@@ -44,10 +46,11 @@ pub struct Proposer<PublicKey: VerifyingKey> {
     digests: Vec<(BatchDigest, WorkerId)>,
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
+    adversary: Option<Arc<Adversary<PublicKey>>>,
 }
 
 impl<PublicKey: VerifyingKey> Proposer<PublicKey> {
-    pub fn spawn(
+    pub(crate) fn spawn(
         name: PublicKey,
         committee: SharedCommittee<PublicKey>,
         signature_service: SignatureService<PublicKey::Sig>,
@@ -56,6 +59,7 @@ impl<PublicKey: VerifyingKey> Proposer<PublicKey> {
         rx_core: Receiver<(Vec<CertificateDigest>, Round)>,
         rx_workers: Receiver<(BatchDigest, WorkerId)>,
         tx_core: Sender<Header<PublicKey>>,
+        adversary: Option<Arc<Adversary<PublicKey>>>,
     ) {
         let genesis = Certificate::genesis(&committee)
             .iter()
@@ -76,6 +80,7 @@ impl<PublicKey: VerifyingKey> Proposer<PublicKey> {
                 last_parents: genesis,
                 digests: Vec::with_capacity(2 * header_size),
                 payload_size: 0,
+                adversary,
             }
             .run()
             .await;
@@ -125,9 +130,19 @@ impl<PublicKey: VerifyingKey> Proposer<PublicKey> {
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
             if (timer_expired || enough_digests) && enough_parents {
-                // Make a new header.
-                self.make_header().await;
-                self.payload_size = 0;
+                if self
+                    .adversary
+                    .as_ref()
+                    .map_or(false, |adversary| adversary.suppress_proposal(self.round))
+                {
+                    // Never construct/sign/store this slot's proposal. Keeping
+                    // payloads allows their inclusion when this authority resumes.
+                    self.last_parents.clear();
+                } else {
+                    // Make a new header.
+                    self.make_header().await;
+                    self.payload_size = 0;
+                }
 
                 // Reschedule the timer.
                 let deadline = Instant::now() + self.max_header_delay;
@@ -142,6 +157,7 @@ impl<PublicKey: VerifyingKey> Proposer<PublicKey> {
 
                     // Advance to the next round.
                     self.round = round + 1;
+                    if let Some(adversary) = &self.adversary { adversary.observe_round(self.round); }
                     debug!("Dag moved to round {}", self.round);
 
                     // Signal that we have enough parent certificates to propose a new header.
@@ -151,7 +167,7 @@ impl<PublicKey: VerifyingKey> Proposer<PublicKey> {
                     self.payload_size += Digest::from(digest).size();
                     self.digests.push((digest, worker_id));
                 }
-                () = &mut timer => {
+                () = &mut timer, if !timer_expired => {
                     // Nothing to do.
                 }
             }

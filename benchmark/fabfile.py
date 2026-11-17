@@ -1,5 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from fabric import task
+from benchmark.adversary import remote_parameters
 from invoke.exceptions import Exit
 from benchmark.seed import SeedData
 
@@ -176,25 +177,35 @@ def install(ctx):
         raise Exit(code=1) from e
 
 
-@task
-def remote(ctx, debug=False, nodes=20, workers=1, rate=50_000, tx_size=512,
-           duration=80, faults=0, runs=1):
+@task(help={
+    'adversary': 'Explicit mode: none/A0, silent/A1, targeted/A3, network/A5; omitted preserves legacy behavior.',
+    'faults': 'Legacy faults (original default when mode omitted); explicit modes default to 0.',
+    'delay-ms': 'Selected message delay in milliseconds, 1..86400000.',
+    'byzantine': 'Fixed Byzantine count (first launch IDs), at most floor((nodes-1)/3).',
+    'byzantine-ids': 'Comma-separated zero-based launch IDs; mutually exclusive with byzantine.',
+    'bullshark-alternating': 'Bullshark only: true or false; alternate normal/unavailable leader slots.',
+    'attack-rounds': 'Attack window length; 0 means unbounded.',
+    'rate': 'Input transactions per second; comma-separated values run a sweep.',
+})
+def remote(ctx, debug=False, nodes=20, workers=1, rate='50000', tx_size=512,
+           duration=80, faults=None, runs=1, adversary='', byzantine=0,
+           byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
+           delay_ms=200, max_pending_messages=4096, max_pending_bytes=67108864,
+           bullshark_alternating='true'):
     ''' Run a collocated AWS benchmark using binaries built by fab install '''
     from benchmark.remote import Bench
-    if nodes < 2 or workers < 1 or duration < 1 or rate < 0 or tx_size < 9 or runs < 1:
-        raise Exit('Require nodes >= 2, workers >= 1, duration >= 1, rate >= 0, tx-size >= 9, runs >= 1.', code=2)
-    if not 0 <= faults < nodes:
-        raise Exit('Require 0 <= faults < nodes.', code=2)
-    bench_params = {
-        'faults': faults,
-        'nodes': [nodes],
-        'workers': workers,
-        'collocate': True,
-        'rate': [rate],
-        'tx_size': tx_size,
-        'duration': duration,
-        'runs': runs,
-    }
+    try:
+        bench_params = remote_parameters(
+            nodes=nodes, workers=workers, rate=rate, tx_size=tx_size,
+            duration=duration, faults=faults, runs=runs,
+            default_faults=0, protocol='bullshark', adversary=adversary,
+            byzantine=byzantine, byzantine_ids=byzantine_ids, seed=seed,
+            start_round=start_round, attack_rounds=attack_rounds, delay_ms=delay_ms,
+            max_pending_messages=max_pending_messages, max_pending_bytes=max_pending_bytes,
+            bullshark_alternating=bullshark_alternating,
+        )
+    except ValueError as e:
+        raise Exit(str(e), code=2) from e
     node_params = {
         'header_size': 1_000,  # bytes
         'max_header_delay': '200ms',  # ms

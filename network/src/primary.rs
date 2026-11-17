@@ -63,10 +63,11 @@ impl PrimaryNetwork {
     ) -> CancelHandler<()> {
         let message =
             BincodeEncodedPayload::try_from(message).expect("Failed to serialize payload");
-        self.send_message(address, message).await
+        self.send_serialized(address, message).await
     }
 
-    async fn send_message(
+    /// Send an already encoded message. Used by bounded benchmark scheduling.
+    pub async fn send_serialized(
         &mut self,
         address: Multiaddr,
         message: BincodeEncodedPayload,
@@ -96,7 +97,7 @@ impl PrimaryNetwork {
             BincodeEncodedPayload::try_from(message).expect("Failed to serialize payload");
         let mut handlers = Vec::new();
         for address in addresses {
-            let handle = self.send_message(address, message.clone()).await;
+            let handle = self.send_serialized(address, message.clone()).await;
             handlers.push(handle);
         }
         handlers
@@ -109,6 +110,15 @@ impl PrimaryNetwork {
     ) -> JoinHandle<()> {
         let message =
             BincodeEncodedPayload::try_from(message).expect("Failed to serialize payload");
+        self.unreliable_send_serialized(address, message).await
+    }
+
+    /// Best-effort delivery of an already encoded message.
+    pub async fn unreliable_send_serialized(
+        &mut self,
+        address: Multiaddr,
+        message: BincodeEncodedPayload,
+    ) -> JoinHandle<()> {
         let mut client = self.client(address);
         tokio::spawn(async move {
             let _ = client.send_message(message).await;

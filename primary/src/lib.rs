@@ -8,6 +8,7 @@
     rust_2021_compatibility
 )]
 
+mod adversary;
 mod aggregators;
 mod block_remover;
 pub mod block_synchronizer;

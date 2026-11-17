@@ -2,6 +2,7 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
+    adversary::Adversary,
     block_remover::DeleteBatchResult,
     block_synchronizer::BlockSynchronizer,
     block_waiter::{BatchMessageError, BatchResult, BlockWaiter},
@@ -95,6 +96,10 @@ impl Primary {
         rx_consensus: Receiver<Certificate<PublicKey>>,
         dag: Option<Arc<Dag<PublicKey>>>,
     ) -> JoinHandle<()> {
+        // Validate once, before starting any primary tasks. Every sender and the
+        // proposer share the same bounded scheduler and round observation.
+        let adversary = Adversary::from_environment(name.clone(), committee.clone())
+            .unwrap_or_else(|error| panic!("Invalid benchmark adversary configuration: {error}"));
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
@@ -193,6 +198,7 @@ impl Primary {
             /* rx_proposer */ rx_headers,
             tx_consensus,
             /* tx_proposer */ tx_parents,
+            adversary.clone(),
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
@@ -241,7 +247,7 @@ impl Primary {
 
         // Responsible for finding missing blocks (certificates) and fetching
         // them from the primary peers by synchronizing also their batches.
-        BlockSynchronizer::spawn(
+        BlockSynchronizer::spawn_with_adversary(
             name.clone(),
             committee.clone(),
             rx_block_synchronizer_commands,
@@ -251,6 +257,7 @@ impl Primary {
             payload_store.clone(),
             certificate_store.clone(),
             parameters.block_synchronizer,
+            adversary.clone(),
         );
 
         // Whenever the `Synchronizer` does not manage to validate a header due to missing parent certificates of
@@ -267,6 +274,7 @@ impl Primary {
             parameters.sync_retry_nodes,
             /* rx_synchronizer */ rx_sync_headers,
             /* tx_core */ tx_headers_loopback,
+            adversary.clone(),
         );
 
         // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
@@ -290,6 +298,7 @@ impl Primary {
             /* rx_core */ rx_parents,
             /* rx_workers */ rx_our_digests,
             /* tx_core */ tx_headers,
+            adversary.clone(),
         );
 
         // The `Helper` is dedicated to reply to certificates & payload availability requests
@@ -300,6 +309,7 @@ impl Primary {
             certificate_store,
             payload_store,
             rx_helper_requests,
+            adversary,
         );
 
         if !internal_consensus {

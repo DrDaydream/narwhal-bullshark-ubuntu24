@@ -33,6 +33,7 @@ async fn successfully_synchronize_batches() {
         /* sync_retry_nodes */ 3,
         rx_synchronizer,
         tx_core,
+        None,
     );
 
     // AND a header
