@@ -7,6 +7,7 @@ from pathlib import Path
 from shlex import quote
 from time import sleep
 
+from benchmark.adversary import resolve_adversary, validate_adversary, write_run_snapshot
 from benchmark.commands import CommandMaker
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
 from benchmark.logs import LogParser, ParseError
@@ -22,7 +23,12 @@ class LocalBench:
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
-        except ConfigError as e:
+            self.adversary = validate_adversary(
+                bench_parameters_dict.get('adversary'), 'bullshark',
+                self.bench_parameters.nodes, self.bench_parameters.faults,
+            )
+            self.benchmark_input = dict(bench_parameters_dict)
+        except (ConfigError, ValueError) as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
     def __getattr__(self, attr):
@@ -77,6 +83,13 @@ class LocalBench:
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())
+            adversary_config = resolve_adversary(self.adversary, names)
+            if adversary_config is not None:
+                snapshot = write_run_snapshot(
+                    PathMaker.results_path(), self.benchmark_input, self.node_parameters.json,
+                    names, adversary_config, nodes, rate, 1, protocol='bullshark-local',
+                )
+                Print.info(f"Adversary: {adversary_config['mode']}; parameters: {snapshot}")
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(self.faults)
@@ -99,7 +112,8 @@ class LocalBench:
                     PathMaker.committee_file(),
                     PathMaker.db_path(i),
                     PathMaker.parameters_file(),
-                    debug=debug
+                    debug=debug,
+                    adversary_config=adversary_config,
                 )
                 log_file = PathMaker.primary_log_file(i)
                 self._background_run(cmd, log_file)

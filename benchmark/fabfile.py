@@ -1,6 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from fabric import task
-from benchmark.adversary import remote_parameters
+from benchmark.adversary import local_parameters, remote_parameters
 from invoke.exceptions import Exit
 from benchmark.seed import SeedData
 
@@ -11,20 +11,24 @@ from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print, BenchError
 
 
-@task
-def local(ctx, debug=True, nodes=4, workers=1, rate=50_000, tx_size=512, duration=20, faults=0):
+@task(help={
+    'adversary': 'Mode: none/A0, silent/A1, targeted/A3, network/A5; omitted keeps legacy behavior.',
+    'header-size': 'Override the local header size in bytes.',
+    'bullshark-alternating': 'Bullshark: true or false for alternate unavailable leader slots.',
+})
+def local(ctx, debug=True, nodes=None, workers=None, rate=None, tx_size=None,
+          duration=None, faults=None, header_size=None, adversary='', byzantine=0,
+          byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
+          delay_ms=200, max_pending_messages=4096, max_pending_bytes=67108864,
+          bullshark_alternating='true'):
     ''' Run benchmarks on localhost '''
-    if nodes < 2 or workers < 1 or duration < 1 or rate < 0 or tx_size < 9:
-        raise Exit('Require nodes >= 2, workers >= 1, duration >= 1, rate >= 0, tx-size >= 9.', code=2)
-    if not 0 <= faults < nodes:
-        raise Exit('Require 0 <= faults < nodes.', code=2)
     bench_params = {
-        'faults': faults,
-        'nodes': nodes,
-        'workers': workers,
-        'rate': rate,
-        'tx_size': tx_size,
-        'duration': duration,
+        'faults': 0,
+        'nodes': 4,
+        'workers': 1,
+        'rate': 50_000,
+        'tx_size': 512,
+        'duration': 20,
     }
     node_params = {
         'header_size': 1_000,  # bytes
@@ -47,6 +51,21 @@ def local(ctx, debug=True, nodes=4, workers=1, rate=50_000, tx_size=512, duratio
         },
         'max_concurrent_requests': 500_000
     }
+    try:
+        bench_params = local_parameters(
+            bench_params, protocol='bullshark', nodes=nodes, workers=workers,
+            rate=rate, tx_size=tx_size, duration=duration, faults=faults,
+            adversary=adversary, byzantine=byzantine, byzantine_ids=byzantine_ids,
+            seed=seed, start_round=start_round, attack_rounds=attack_rounds,
+            delay_ms=delay_ms, max_pending_messages=max_pending_messages,
+            max_pending_bytes=max_pending_bytes, bullshark_alternating=bullshark_alternating,
+        )
+        if header_size is not None:
+            node_params['header_size'] = int(header_size)
+        if node_params['header_size'] < 1:
+            raise ValueError('header-size must be positive')
+    except ValueError as e:
+        raise Exit(str(e), code=2) from e
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
         print(ret.result())
