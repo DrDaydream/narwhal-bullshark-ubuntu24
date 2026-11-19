@@ -18,7 +18,7 @@ import subprocess
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
-from benchmark.adversary import resolve_adversary, validate_adversary, write_run_snapshot
+from benchmark.adversary import active_launch_ids, resolve_adversary, validate_adversary, write_run_snapshot
 from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
 
@@ -368,6 +368,7 @@ chronyc waitsync 60 0.01 0.0 1
     def _run_single(self, rate, committee, bench_parameters, debug=False,
                     adversary_config=None):
         faults = bench_parameters.faults
+        active = set(active_launch_ids(committee.size(), adversary_config, faults))
 
         # Kill any potentially unfinished run and delete logs.
         hosts = committee.ips()
@@ -377,23 +378,26 @@ chronyc waitsync 60 0.01 0.0 1
         # Filter all faulty nodes from the client addresses (or they will wait
         # for the faulty nodes to be online).
         Print.info('Booting clients...')
-        workers_addresses = committee.workers_addresses(faults)
+        workers_addresses = {i: rows for i, rows in enumerate(committee.workers_addresses(0))
+                             if i in active}
         rate_share = ceil(rate / committee.workers())
-        for i, addresses in enumerate(workers_addresses):
+        for i, addresses in workers_addresses.items():
             for (id, address) in addresses:
                 host = Committee.ip(address)
                 cmd = CommandMaker.run_client(
                     address,
                     bench_parameters.tx_size,
                     rate_share,
-                    [x for y in workers_addresses for _, x in y]
+                    [x for y in workers_addresses.values() for _, x in y]
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
 
         # Run the primaries (except the faulty ones).
         Print.info('Booting primaries...')
-        for i, address in enumerate(committee.primary_addresses(faults)):
+        for i, address in enumerate(committee.primary_addresses(0)):
+            if i not in active:
+                continue
             host = Committee.ip(address)
             cmd = CommandMaker.run_primary(
                 PathMaker.key_file(i),
@@ -408,7 +412,7 @@ chronyc waitsync 60 0.01 0.0 1
 
         # Run the workers (except the faulty ones).
         Print.info('Booting workers...')
-        for i, addresses in enumerate(workers_addresses):
+        for i, addresses in workers_addresses.items():
             for (id, address) in addresses:
                 host = Committee.ip(address)
                 cmd = CommandMaker.run_worker(
@@ -428,15 +432,17 @@ chronyc waitsync 60 0.01 0.0 1
             sleep(ceil(duration / 20))
         self.kill(hosts=hosts, delete_logs=False)
 
-    def _logs(self, committee, faults):
+    def _logs(self, committee, faults, adversary=None):
+        active = set(active_launch_ids(committee.size(), adversary, faults))
         # Delete local logs (if any).
         cmd = CommandMaker.clean_logs()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
         # Download log files.
-        workers_addresses = committee.workers_addresses(faults)
+        workers_addresses = [(i, rows) for i, rows in enumerate(committee.workers_addresses(0))
+                             if i in active]
         progress = progress_bar(workers_addresses, prefix='Downloading workers logs:')
-        for i, addresses in enumerate(progress):
+        for i, addresses in progress:
             for id, address in addresses:
                 host = Committee.ip(address)
                 c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
@@ -449,9 +455,10 @@ chronyc waitsync 60 0.01 0.0 1
                     local=PathMaker.worker_log_file(i, id)
                 )
 
-        primary_addresses = committee.primary_addresses(faults)
+        primary_addresses = [(i, address) for i, address in enumerate(committee.primary_addresses(0))
+                             if i in active]
         progress = progress_bar(primary_addresses, prefix='Downloading primaries logs:')
-        for i, address in enumerate(progress):
+        for i, address in progress:
             host = Committee.ip(address)
             c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
             c.get(
@@ -461,7 +468,7 @@ chronyc waitsync 60 0.01 0.0 1
 
         # Parse logs and return the parser.
         Print.info('Parsing logs and computing performance...')
-        return LogParser.process(PathMaker.logs_path(), faults=faults)
+        return LogParser.process(PathMaker.logs_path(), faults=faults, adversary=adversary, committee_size=committee.size())
 
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
@@ -531,7 +538,7 @@ chronyc waitsync 60 0.01 0.0 1
                         )
 
                         faults = bench_parameters.faults
-                        logger = self._logs(committee_copy, faults)
+                        logger = self._logs(committee_copy, faults, adversary=adversary)
                         logger.print(PathMaker.result_file(
                             faults,
                             n,

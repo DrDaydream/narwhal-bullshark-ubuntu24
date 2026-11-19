@@ -7,7 +7,7 @@ from pathlib import Path
 from shlex import quote
 from time import sleep
 
-from benchmark.adversary import resolve_adversary, validate_adversary, write_run_snapshot
+from benchmark.adversary import active_launch_ids, resolve_adversary, validate_adversary, write_run_snapshot
 from benchmark.commands import CommandMaker
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
 from benchmark.logs import LogParser, ParseError
@@ -84,6 +84,7 @@ class LocalBench:
 
             self.node_parameters.print(PathMaker.parameters_file())
             adversary_config = resolve_adversary(self.adversary, names)
+            active = set(active_launch_ids(nodes, adversary_config, self.faults))
             if adversary_config is not None:
                 snapshot = write_run_snapshot(
                     PathMaker.results_path(), self.benchmark_input, self.node_parameters.json,
@@ -92,21 +93,24 @@ class LocalBench:
                 Print.info(f"Adversary: {adversary_config['mode']}; parameters: {snapshot}")
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
+            workers_addresses = {i: rows for i, rows in enumerate(committee.workers_addresses(0))
+                                 if i in active}
             rate_share = ceil(rate / committee.workers())
-            for i, addresses in enumerate(workers_addresses):
+            for i, addresses in workers_addresses.items():
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_client(
                         address,
                         self.tx_size,
                         rate_share,
-                        [x for y in workers_addresses for _, x in y]
+                        [x for y in workers_addresses.values() for _, x in y]
                     )
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)
 
             # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
+            for i, address in enumerate(committee.primary_addresses(0)):
+                if i not in active:
+                    continue
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
@@ -119,7 +123,7 @@ class LocalBench:
                 self._background_run(cmd, log_file)
 
             # Run the workers (except the faulty ones).
-            for i, addresses in enumerate(workers_addresses):
+            for i, addresses in workers_addresses.items():
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_worker(
                         PathMaker.key_file(i),
@@ -139,7 +143,8 @@ class LocalBench:
 
             # Parse logs and return the parser.
             Print.info('Parsing logs...')
-            return LogParser.process(PathMaker.logs_path(), faults=self.faults)
+            return LogParser.process(PathMaker.logs_path(), faults=self.faults,
+                                     adversary=self.adversary, committee_size=nodes)
 
         except KeyboardInterrupt:
             self._kill_nodes()

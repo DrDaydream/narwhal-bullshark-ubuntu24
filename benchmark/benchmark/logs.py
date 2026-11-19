@@ -1,5 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from datetime import datetime
+import json
+from pathlib import Path
 from dateutil import parser
 from glob import glob
 from logging import exception
@@ -10,6 +12,7 @@ from statistics import mean
 
 
 from benchmark.utils import Print
+from benchmark.adversary import crash_population
 from benchmark.measurements import Measurements, format_measurements
 
 
@@ -24,6 +27,8 @@ class LogParser:
         assert all(isinstance(x, str) for y in inputs for x in y)
         assert all(x for x in inputs)
 
+        self.crashed_primary_ids = []
+        self.primary_ids = list(range(len(primaries)))
         self.faults = faults
         if isinstance(faults, int):
             self.committee_size = len(primaries) + int(faults)
@@ -88,7 +93,11 @@ class LogParser:
         + duration). Without it, the observed log span is labelled as such.
         No runner, workload, or protocol behavior is changed by this parser.
         """
-        return self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
+        metrics = self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
+        metrics['crashed_primary_ids'] = self.crashed_primary_ids
+        for row, ident in zip(metrics['replicas'], self.primary_ids):
+            row['replica'] = ident
+        return metrics
 
     def _merge_results(self, input):
         # Keep the earliest timestamp.
@@ -237,6 +246,7 @@ class LogParser:
             '-----------------------------------------\n'
             ' + CONFIG:\n'
             f' Faults: {self.faults} node(s)\n'
+            f' Crashed authority IDs: {",".join(map(str, self.crashed_primary_ids)) or "none"}\n'
             f' Committee size: {self.committee_size} node(s)\n'
             f' Worker(s) per node: {self.workers} worker(s)\n'
             f' Collocate primary and workers: {self.collocate}\n'
@@ -278,8 +288,16 @@ class LogParser:
             output.write('\n')
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, faults=0, adversary=None, committee_size=None):
         assert isinstance(directory, str)
+        primary_files = sorted(glob(join(directory, 'primary-*.log')))
+        primary_ids = [int(Path(p).stem.split('-')[1]) for p in primary_files]
+        try:
+            crash = crash_population(directory, primary_ids, adversary, committee_size)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            raise ParseError(f'Invalid crash population: {error}') from error
+        if crash:
+            faults = len(crash['crashed_primary_ids'])
 
         client_files = sorted(glob(join(directory, 'client-*.log')))
         worker_files = sorted(glob(join(directory, 'worker-*.log')))
@@ -302,10 +320,18 @@ class LogParser:
                 workers += [f.read()]
 
         result = cls(clients, primaries, workers, faults=faults)
+        result.primary_ids = primary_ids
         result.measurements.source_logs = [
             {'client': c, 'worker': w} for c, w in zip(client_files, worker_files)
         ]
         result.measurements.replica_logs = sorted(glob(join(directory, 'primary-*.log')))
+        if crash is not None:
+            result.crashed_primary_ids = crash['crashed_primary_ids']
+            result.committee_size = crash['committee_size']
+            result.faults = len(crash['crashed_primary_ids'])
+            temporary = Path(directory) / 'measurement-population.json.tmp'
+            temporary.write_text(json.dumps(crash, indent=2) + '\n', encoding='utf-8')
+            temporary.replace(Path(directory) / 'measurement-population.json')
         return result
 
 
