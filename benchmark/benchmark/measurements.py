@@ -13,6 +13,9 @@ from statistics import mean
 _TIME = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})')
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _VERSION = 'Benchmark latency instrumentation version 1'
+_READY_VERSION = 'Benchmark rule-ready instrumentation version 1'
+_READY_DISTRIBUTIONS = ('release_to_rule_ready', 'rule_ready_to_final',
+                        'paired_release_to_rule_ready', 'paired_release_to_final')
 
 
 def _unix_us(text):
@@ -53,6 +56,8 @@ class Measurements:
         self.starts = []
         self.last_log_us = 0
         self.final = []
+        self.ready = []
+        self.ready_supported = []
         self.aba = []
         self.replica_logs = [f'primary-log-{i}' for i in range(len(primaries))]
         self.source_logs = [{'client': f'client-log-{i}', 'worker': f'worker-log-{i}'}
@@ -79,6 +84,14 @@ class Measurements:
                              and (_VERSION in worker or bool(ingress)),
             })
         for primary in primaries:
+            readiness = {}
+            for digest, stamp in re.findall(
+                    r'Benchmark batch rule-ready (\S+) at_us (\d+)', primary):
+                stamp = int(stamp)
+                readiness[digest] = min(readiness.get(digest, stamp), stamp)
+            self.ready.append(readiness)
+            self.ready_supported.append(_READY_VERSION in primary or bool(readiness))
+            self.last_log_us = max(self.last_log_us, max(readiness.values(), default=0))
             commits = {}
             for line in primary.splitlines():
                 match = re.search(r'\bCommitted B\d+\([^)]*\) -> (\S+)', line)
@@ -123,8 +136,11 @@ class Measurements:
         status = ('available' if supported == len(self.sources) and self.sources
                   else 'partial' if supported else 'unavailable')
         replicas, pooled = [], [[], [], []]
+        ready_pooled = {name: [] for name in _READY_DISTRIBUTIONS}
         for replica, final in enumerate(self.final):
             values = [[], [], []]
+            ready_values = {name: [] for name in _READY_DISTRIBUTIONS}
+            ready_unfinalized = invalid_ready = 0
             completed = not_received = missing_ingress = invalid = 0
             for source_id, ident, released in cohort:
                 source = self.sources[source_id]
@@ -133,6 +149,21 @@ class Measurements:
                     not_received += 1
                 committed = min((final[batch] for batch in source['batches'].get(ident, ())
                                  if batch in final), default=None)
+                readiness = self.ready[replica]
+                ready_at = min((readiness[batch] for batch in source['batches'].get(ident, ())
+                                if batch in readiness), default=None)
+                if ready_at is not None and ready_at <= cutoff:
+                    if (received is None or not released <= received <= ready_at
+                            or (committed is not None and committed < ready_at)):
+                        invalid_ready += 1
+                    else:
+                        ready_values['release_to_rule_ready'].append(ready_at - released)
+                        if committed is None or committed > cutoff:
+                            ready_unfinalized += 1
+                        else:
+                            ready_values['rule_ready_to_final'].append(committed - ready_at)
+                            ready_values['paired_release_to_rule_ready'].append(ready_at - released)
+                            ready_values['paired_release_to_final'].append(committed - released)
                 if committed is None or committed > cutoff:
                     continue
                 completed += 1
@@ -155,15 +186,27 @@ class Measurements:
                 'missing_ingress_samples': missing_ingress,
                 'invalid_time_samples': invalid,
                 'paired_samples': len(values[0]),
+                'rule_ready_samples': len(ready_values['release_to_rule_ready']),
+                'ready_unfinalized_samples': ready_unfinalized,
+                'invalid_rule_ready_samples': invalid_ready,
+                'rule_ready_instrumented': self.ready_supported[replica],
                 'completion_ratio': completed / len(cohort) if cohort else None,
             }
             for name, samples, all_samples in zip(
                     ('release_to_final', 'ingress_to_final', 'release_to_ingress'), values, pooled):
                 row[name] = _distribution(samples)
                 all_samples.extend(samples)
+            for name, samples in ready_values.items():
+                row[name] = _distribution(samples)
+                ready_pooled[name].extend(samples)
             replicas.append(row)
+        ready_supported = sum(self.ready_supported)
+        ready_status = ('available' if self.ready_supported and all(self.ready_supported)
+                        else 'partial' if ready_supported else 'unavailable')
         result = {
             'schema_version': 1, 'status': status,
+            'rule_ready_status': ready_status,
+            'rule_ready_instrumented_replicas': ready_supported,
             'window_basis': 'configured_duration' if duration is not None else 'observed_log_span',
             'window_start_us': start, 'window_end_us': end, 'commit_cutoff_us': cutoff,
             'window_seconds': (end - start) / 1000000,
@@ -177,6 +220,8 @@ class Measurements:
                 ('release_to_final', 'ingress_to_final', 'release_to_ingress'), pooled)},
             'aba': self._aba_metrics(start, end),
         }
+        result['pooled'].update({name: _distribution(samples)
+                                 for name, samples in ready_pooled.items()})
         return result
 
     def _aba_metrics(self, start, end):
@@ -231,7 +276,7 @@ def format_measurements(metrics):
         ' Latency population: paired transaction-replica samples (pooled raw observations)',
     ]
     for label, key in (
-            ('Release -> final commit (main)', 'release_to_final'),
+            ('Release -> final commit (E2E verification)', 'release_to_final'),
             ('Ingress -> final commit (auxiliary)', 'ingress_to_final'),
             ('Release -> ingress (paired decomposition)', 'release_to_ingress')):
         row = metrics['pooled'][key]
@@ -241,6 +286,21 @@ def format_measurements(metrics):
         lines.append(f" Replica {row['replica']}: completed/released {row['completed_samples']}/{row['released_samples']}; "
                      f"unfinished {row['unfinished_samples']}; not received {row['not_received_samples']}; "
                      f"missing ingress {row['missing_ingress_samples']}; invalid clocks {row['invalid_time_samples']}")
+    if 'rule_ready_status' in metrics:
+        lines.append(' + RULE-READY MEASUREMENTS:')
+        lines.append(f" Rule-ready instrumentation: {metrics['rule_ready_status']}")
+        for label, key in (
+                ('Release -> rule-ready (plot metric)', 'release_to_rule_ready'),
+                ('Rule-ready -> final (paired completed samples)', 'rule_ready_to_final'),
+                ('Release -> rule-ready (paired completed samples)', 'paired_release_to_rule_ready'),
+                ('Release -> final (same paired completed samples)', 'paired_release_to_final')):
+            row = metrics['pooled'][key]
+            lines.append(f" {label}: mean {display(row['mean_ms'])} ms; "
+                         f"P95 {display(row['p95_ms'])} ms; n={row['count']}")
+        for row in metrics['replicas']:
+            lines.append(f" Rule-ready replica {row['replica']}: ready {row['rule_ready_samples']}; "
+                         f"ready but not final {row['ready_unfinalized_samples']}; "
+                         f"invalid ready clocks {row['invalid_rule_ready_samples']}")
     aba = metrics['aba']
     if aba is not None:
         lines.append(' ABA traffic: signed envelope + 4-byte framing; per-peer writes including successful retries')

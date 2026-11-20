@@ -37,6 +37,8 @@ pub struct State<PublicKey: VerifyingKey> {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
     /// must be regularly cleaned up through the function `update`.
     dag: Dag<PublicKey>,
+    #[cfg(feature = "benchmark")]
+    rule_ready_log: crate::readiness::RuleReadyLog,
 }
 
 impl<PublicKey: VerifyingKey> State<PublicKey> {
@@ -48,6 +50,8 @@ impl<PublicKey: VerifyingKey> State<PublicKey> {
 
         Self {
             last_committed_round: 0,
+            #[cfg(feature = "benchmark")]
+            rule_ready_log: crate::readiness::RuleReadyLog::default(),
             last_committed: genesis
                 .iter()
                 .map(|(x, (_, y))| (x.clone(), y.round()))
@@ -134,6 +138,8 @@ impl<PublicKey: VerifyingKey> Consensus<PublicKey> {
     }
 
     async fn run(&mut self) -> StoreResult<()> {
+        #[cfg(feature = "benchmark")]
+        tracing::info!("Benchmark rule-ready instrumentation version 1");
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
 
@@ -237,13 +243,21 @@ impl<PublicKey: VerifyingKey> Consensus<PublicKey> {
 
         // Get an ordered list of past leaders that are linked to the current leader.
         debug!("Leader {:?} has enough support", leader);
+        let leaders = Consensus::order_leaders(committee, leader, state);
+        // All of these leaders are now selected by the rule. Capture once, before
+        // persisting earlier leaders, so store latency cannot shift later readiness.
+        #[cfg(feature = "benchmark")]
+        let ready_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("System clock is before Unix epoch")
+            .as_micros();
         let mut sequence = Vec::new();
-        for leader in Consensus::order_leaders(committee, leader, state)
-            .iter()
-            .rev()
-        {
+        for leader in leaders.iter().rev() {
             // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
-            for x in Consensus::order_dag(gc_depth, leader, state) {
+            let ordered = Consensus::order_dag(gc_depth, leader, state);
+            #[cfg(feature = "benchmark")]
+            state.rule_ready_log.record(&ordered, ready_at);
+            for x in ordered {
                 let digest = x.digest();
 
                 // Update and clean up internal state.

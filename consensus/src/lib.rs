@@ -10,6 +10,8 @@
 pub mod dag;
 pub mod subscriber;
 pub mod tusk;
+#[cfg(feature = "benchmark")]
+mod readiness;
 
 pub use crate::{subscriber::SubscriberHandler, tusk::Consensus};
 
